@@ -1,0 +1,35 @@
+{
+  "name": "microsoft-webauth-playwright",
+  "version": "1.0.0",
+  "description": "Microsoft web authentication via Playwright — extracted from MSOneNote Exporter",
+  "main": "src/index.js",
+  "bin": {
+    "webauth": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node src/index.js login",
+    "check": "node src/index.js check",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "keywords": [
+    "microsoft",
+    "authentication",
+    "playwright",
+    "webauth",
+    "mfa"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^14.0.3",
+    "fs-extra": "^11.3.3",
+    "playwright": "^1.58.1",
+    "readline": "^1.3.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}

@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Authentication files (DO NOT COMMIT)
+auth.json
+auth-meta.json
+test/
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+coverage/
+
+# Temp files
+tmp/
+*.html
+debug_*.html
+
+# OS
+.DS_Store
+Thumbs.db
+.qwen
+QWEN.md
