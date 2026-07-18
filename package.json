@@ -1,10 +1,10 @@
 {
-  "name": "@msout/microsoft-webauth-playwright-js",
-  "version": "0.0.1",
+  "name": "@msout/microsoft-webauth",
+  "version": "0.0.2",
   "description": "Microsoft web authentication module, using playwright to automate the login process and retrieve cookies for authenticated sessions.",
   "main": "src/index.js",
   "bin": {
-    "webauth": "src/index.js"
+    "microsoft-webauth": "src/index.js"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -25,7 +25,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth-playwright-js.git"
+    "url": "git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth.git"
   },
   "dependencies": {
     "chalk": "^4.1.2",
