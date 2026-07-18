@@ -1,10 +1,10 @@
 {
-  "name": "microsoft-webauth-playwright",
-  "version": "1.0.0",
-  "description": "Microsoft web authentication via Playwright — extracted from MSOneNote Exporter",
+  "name": "@msout/microsoft-webauth-playwright-js",
+  "version": "0.0.1",
+  "description": "Microsoft web authentication module, using playwright to automate the login process and retrieve cookies for authenticated sessions.",
   "main": "src/index.js",
   "bin": {
-    "webauth": "./src/index.js"
+    "webauth": "src/index.js"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -18,10 +18,15 @@
     "authentication",
     "playwright",
     "webauth",
-    "mfa"
+    "mfa",
+    "javascript"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "msout@tuta.io",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth-playwright-js.git"
+  },
   "dependencies": {
     "chalk": "^4.1.2",
     "commander": "^14.0.3",
