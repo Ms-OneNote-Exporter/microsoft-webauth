@@ -70,6 +70,60 @@ async function waitForAuthSuccess(page, targetUrl) {
     }
 }
 
+/**
+ * Clicks the page-level "Cancel" button on the FIDO/security-key page and
+ * waits for the browser to navigate away. Works because the addInitScript
+ * override makes navigator.credentials.create() reject immediately, so the
+ * native OS-level WebAuthn dialog never appears and the DOM is fully accessible.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} logger
+ */
+async function dismissFidoPage(page, logger) {
+    // Try multiple selectors for the page-level Cancel button.
+    // On the FIDO page there are two Cancel-labelled things:
+    //   1. The native OS WebAuthn dialog (blocked by addInitScript — never appears)
+    //   2. The page-level gray "Cancel" button at the bottom of the form
+    const cancelSelectors = [
+        // Exact role button with text "Cancel" (the bottom-of-form button)
+        'button:has-text("Cancel")',
+        '[value="Cancel"]',
+        'input[type="button"][value="Cancel"]',
+    ];
+
+    let clicked = false;
+    for (const sel of cancelSelectors) {
+        try {
+            const btn = page.locator(sel).first();
+            await btn.waitFor({ state: 'visible', timeout: 4000 });
+            logger.info(`FIDO: clicking page-level Cancel via selector "${sel}"...`);
+            await btn.click({ force: true });
+            clicked = true;
+            break;
+        } catch (_) {
+            // try next selector
+        }
+    }
+
+    if (!clicked) {
+        // Last resort: JS click on any visible Cancel button
+        logger.warn('FIDO: DOM selectors failed, trying JS click fallback...');
+        await page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
+            const cancel = btns.find(b => /^cancel$/i.test((b.textContent || b.value || '').trim()));
+            if (cancel) cancel.click();
+        });
+    }
+
+    // Wait for navigation away from the FIDO page (up to 8 s)
+    try {
+        await page.waitForURL(url => !url.toString().includes('/fido/'), { timeout: 8000 });
+        logger.debug('FIDO: navigated away from FIDO page successfully.');
+    } catch (_) {
+        logger.warn('FIDO: still on FIDO URL after Cancel — continuing anyway.');
+    }
+}
+
 async function login(credentials = {}) {
     const { email, password, targetUrl } = credentials;
     const isAutomated = !!(email && password);
@@ -90,10 +144,38 @@ async function login(credentials = {}) {
     }
 
     const browser = await chromium.launch({ headless: !!headless });
-    const context = await browser.newContext();
+    const context = await browser.newContext({
+        // Disable WebAuthn/FIDO hardware key prompts
+        ignoreHTTPSErrors: false,
+    });
     const page = await context.newPage();
 
+    // Dismiss any native browser dialogs (alert/confirm/prompt) automatically
+    page.on('dialog', async dialog => {
+        logger.debug(`[dialog] Auto-dismissing native dialog: type=${dialog.type()}, message="${dialog.message()}"`);
+        await dialog.dismiss();
+    });
+
     try {
+        // Inject WebAuthn override BEFORE any navigation.
+        // navigator.credentials.create() triggers a native OS-level dialog that
+        // Playwright cannot dismiss via DOM clicks. Rejecting it programmatically
+        // prevents the dialog from ever appearing, making the page-level Cancel
+        // button accessible instead.
+        await page.addInitScript(() => {
+            if (typeof navigator !== 'undefined' && navigator.credentials) {
+                navigator.credentials.create = () =>
+                    Promise.reject(new DOMException('Cancelled by automation', 'NotAllowedError'));
+                navigator.credentials.get = (options) => {
+                    if (options && options.publicKey) {
+                        return Promise.reject(new DOMException('Cancelled by automation', 'NotAllowedError'));
+                    }
+                    // Allow password-manager / federated credential requests through
+                    return Promise.reject(new DOMException('Cancelled by automation', 'NotAllowedError'));
+                };
+            }
+        });
+
         await page.goto(finalTargetUrl);
 
         if (isAutomated) {
@@ -312,6 +394,34 @@ async function login(credentials = {}) {
                 const debugFile = path.join(dumpDir, 'debug_after_password.html');
                 await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
                 logger.debug(`[dodump] Post-password state dumped to ${displayPath}/debug_after_password.html`);
+            }
+
+            // 2.5b. Handle FIDO/security key page (login.microsoft.com/consumers/fido/create)
+            // The addInitScript above makes navigator.credentials.create() reject immediately,
+            // so the native OS WebAuthn dialog never appears. We only need to click the
+            // page-level "Cancel" button and wait for navigation away from the FIDO URL.
+            try {
+                const currentUrl = page.url();
+                const onFidoPage = currentUrl.includes('/fido/');
+
+                if (onFidoPage) {
+                    logger.info(`Already on FIDO page (${currentUrl}). Clicking page-level Cancel...`);
+                    await dismissFidoPage(page, logger);
+                } else {
+                    // Race: either we navigate to fido, or 8 s passes (no fido page)
+                    const fidoHandled = await Promise.race([
+                        page.waitForURL(url => url.toString().includes('/fido/'), { timeout: 8000 })
+                            .then(async () => {
+                                logger.info(`Navigated to FIDO page: ${page.url()}. Dismissing...`);
+                                await dismissFidoPage(page, logger);
+                                return 'fido_cancelled';
+                            }),
+                        page.waitForTimeout(8000).then(() => 'no_fido'),
+                    ]);
+                    logger.debug(`FIDO check result: ${fidoHandled}`);
+                }
+            } catch (e) {
+                logger.debug(`FIDO popup handler skipped: ${e.message}`);
             }
 
             // 2.5. Handle post-password MFA/Verification if needed
