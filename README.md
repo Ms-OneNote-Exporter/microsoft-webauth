@@ -1,4 +1,10 @@
-# microsoft-webauth-playwright
+# microsoft-webauth
+
+A tool to authenticate against microsoft online (live or professionnal tenants)
+e.g: 
+  - https://onenote.cloud.microsoft/notebooks
+  - https://outlook.live.com/mail/
+  - and by extension https://login.microsoft.com
 
 Microsoft web authentication via Playwright — extracted from [MSOneNote Exporter](https://github.com/msout/Microsoft-OneNote-Exporter).
 
@@ -7,17 +13,20 @@ This is a standalone CLI tool for authenticating with Microsoft accounts using P
 - Manual login in browser
 - MFA/2FA support (OTC codes, number matching)
 - Session persistence
+## Available on npmjs
+
+You can find this package here: https://www.npmjs.com/package/@msout/microsoft-webauth
 
 ## Installation
 
 ```bash
-npm install -g @msout/microsoft-webauth-playwright
+npm install -g @msout/microsoft-webauth
 ```
 
 Or locally:
 
 ```bash
-npm install @msout/microsoft-webauth-playwright
+npm install @msout/microsoft-webauth
 ```
 
 ## Usage
@@ -25,13 +34,13 @@ npm install @msout/microsoft-webauth-playwright
 ### Login (Automated)
 
 ```bash
-webauth login --email your@email.com --password yourpassword
+microsoft-webauth login --email your@email.com --password yourpassword
 ```
 
 ### Login (Manual/Interactive)
 
 ```bash
-webauth login
+microsoft-webauth login
 ```
 
 This will open a browser window. Log in manually, then press Enter when you see the notebooks list.
@@ -39,13 +48,13 @@ This will open a browser window. Log in manually, then press Enter when you see 
 ### Check Authentication Status
 
 ```bash
-webauth check
+microsoft-webauth check
 ```
 
 ### Logout
 
 ```bash
-webauth logout
+microsoft-webauth logout
 ```
 
 ## Options
