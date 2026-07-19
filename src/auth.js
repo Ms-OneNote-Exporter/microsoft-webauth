@@ -1,3 +1,8 @@
+/**
+ * @fileoverview This file handles user authentication logic.
+ * @author phptr,enoola,msout
+ * @copyright 2026 phptr,enoola,msout
+ */
 const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
@@ -486,7 +491,7 @@ async function login(credentials = {}) {
             } catch (e) {
                 logger.debug(`Post-password verification handling skipped or failed: ${e.message}`);
             }
-            
+
             // 2.7. Handle "Help protect your account" interrupt screen
             try {
                 const interruptPrompt = page.getByText(/Help protect your account/i).first();

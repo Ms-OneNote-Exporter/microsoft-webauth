@@ -1,3 +1,8 @@
+/**
+ * @fileoverview Returns the directory where auth files (auth.json, auth-meta.json) are stored.
+ * @author phptr,enoola,msout
+ * @copyright 2026 phptr,enoola,msout
+ */
 const path = require('path');
 
 /**

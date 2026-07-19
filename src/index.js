@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+/**
+ * @fileoverview Main CLI interface to handle authentication commands.
+ * @author phptr,enoola,msout
+ * @copyright 2026 phptr,enoola,msout
+ */
 const { program } = require('commander');
 const logger = require('./utils/logger');
 const { login, checkAuth, getAuthMeta, logout } = require('./auth');
