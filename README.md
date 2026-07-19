@@ -1,18 +1,24 @@
 # microsoft-webauth
 
 A tool to authenticate against microsoft online (live or professionnal tenants)
+We do not rely on GraphAPI.
 e.g: 
   - https://onenote.cloud.microsoft/notebooks
   - https://outlook.live.com/mail/
   - and by extension https://login.microsoft.com
 
-Microsoft web authentication via Playwright — extracted from [MSOneNote Exporter](https://github.com/msout/Microsoft-OneNote-Exporter).
+Microsoft web authentication via Playwright — extracted from [MSOneNote Exporter](https://github.com/enoola/Microsoft-OneNote-Exporter).
+I did extract it realising it might be useful out of the box for other projects.
+And it will make it easier to maintain as far as I see it.
 
 This is a standalone CLI tool for authenticating with Microsoft accounts using Playwright. It handles:
+- NO GraphAPI
 - Automated login with email/password
 - Manual login in browser
 - MFA/2FA support (OTC codes, number matching)
 - Session persistence
+
+
 ## Available on npmjs
 
 You can find this package here: https://www.npmjs.com/package/@msout/microsoft-webauth

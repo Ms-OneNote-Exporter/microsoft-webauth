@@ -1,6 +1,6 @@
 {
   "name": "@msout/microsoft-webauth",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Microsoft web authentication module, using playwright to automate the login process and retrieve cookies for authenticated sessions.",
   "main": "src/index.js",
   "bin": {
@@ -22,7 +22,7 @@
     "javascript"
   ],
   "author": "msout@tuta.io",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth.git"
