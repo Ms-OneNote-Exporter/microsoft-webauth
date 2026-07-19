@@ -2,6 +2,7 @@
 
 A tool to authenticate against microsoft online (live or professionnal tenants)
 We do not rely on GraphAPI.
+
 e.g: 
   - https://onenote.cloud.microsoft/notebooks
   - https://outlook.live.com/mail/
@@ -18,6 +19,13 @@ This is a standalone CLI tool for authenticating with Microsoft accounts using P
 - MFA/2FA support (OTC codes, number matching)
 - Session persistence
 
+## Why this project ?
+
+While this let you authenticate this is a part of a bigger purpose,
+primary aim is to offer people a simple way to get out of Microsoft OneNote, because you regardless of what ms documentation states
+=> https://learn.microsoft.com/en-us/answers/questions/2276682/onenote-api-fails-with-large-sharepoint-document-l
+
+in essence you want to search for microsoft-onenote-list-notebook, microsoft-onenote-exporter
 
 ## Available on npmjs
 
@@ -108,3 +116,4 @@ microsoft-webauth-playwright/
 ## License
 
 ISC — same as MSOneNote Exporter.
+
