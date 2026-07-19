@@ -1,6 +1,6 @@
 {
   "name": "@msout/microsoft-webauth",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "description": "Microsoft web authentication module, using playwright to automate the login process and retrieve cookies for authenticated sessions.",
   "main": "src/index.js",
   "bin": {
