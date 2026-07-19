@@ -1,3 +1,6 @@
 node_modules/
 *.tgz
 .env
+auth.json
+auth-meta.json
+logs
