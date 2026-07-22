@@ -6,27 +6,94 @@
 const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
-const { AUTH_FILE, ONENOTE_URL, OUTLOOK_URL } = require('./config');
+const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir } = require('./config');
 const path = require('path');
 const readline = require('readline');
 
-// Companion metadata file — stores email + login time for display
-const AUTH_META_FILE = AUTH_FILE.replace('auth.json', 'auth-meta.json');
+/** Returns the auth file path, defaulting to DEFAULT_AUTH_FILE */
+function getAuthFilePath(authFilePath) {
+    return authFilePath || DEFAULT_AUTH_FILE;
+}
 
 /** Returns { email, loginTime } from auth-meta.json, or null if not found. */
-async function getAuthMeta() {
+async function getAuthMeta(authFilePath) {
+    const filePath = getAuthFilePath(authFilePath);
+    const metaPath = getAuthMetaFilePath(filePath);
     try {
-        if (await fs.pathExists(AUTH_META_FILE)) {
-            return await fs.readJson(AUTH_META_FILE);
+        if (await fs.pathExists(metaPath)) {
+            return await fs.readJson(metaPath);
         }
     } catch (e) { }
     return null;
 }
 
+/** Generates backup path by appending .old to file */
+function getBackupPath(filePath) {
+    return filePath + '.old';
+}
+
+/**
+ * Checks if files exist and handles backup logic
+ * Returns object with { authFileExists, metaFileExists, willOverwriteOld }
+ */
+async function checkAndPrepareFiles(authFilePath) {
+    const metaFilePath = getAuthMetaFilePath(authFilePath);
+
+    const authFileExists = await fs.pathExists(authFilePath);
+    const metaFileExists = await fs.pathExists(metaFilePath);
+
+    // Check if .old versions exist
+    const authOldPath = getBackupPath(authFilePath);
+    const metaOldPath = getBackupPath(metaFilePath);
+    const authOldExists = await fs.pathExists(authOldPath);
+    const metaOldExists = await fs.pathExists(metaOldPath);
+
+    let willOverwriteOld = false;
+
+    // If current files exist, backup them
+    if (authFileExists || metaFileExists) {
+        // Warn if .old files already exist (they will be erased)
+        if (authOldExists || metaOldExists) {
+            logger.warn(`Warning: Backup files (.old) already exist and will be erased:`);
+            if (authOldExists) logger.warn(`  ${authOldPath}`);
+            if (metaOldExists) logger.warn(`  ${metaOldPath}`);
+            willOverwriteOld = true;
+        }
+
+        // Create backup directory if it doesn't exist
+        const dir = path.dirname(authFilePath);
+        await ensureAuthDir(authFilePath);
+
+        // Backup existing files
+        if (authFileExists) {
+            await fs.move(authFilePath, authOldPath, { overwrite: true });
+            logger.info(`Backed up ${authFilePath} to ${authOldPath}`);
+        }
+        if (metaFileExists) {
+            await fs.move(metaFilePath, metaOldPath, { overwrite: true });
+            logger.info(`Backed up ${metaFilePath} to ${metaOldPath}`);
+        }
+    } else {
+        // Ensure directory exists for new files
+        await ensureAuthDir(authFilePath);
+    }
+
+    return {
+        authFileExists,
+        metaFileExists,
+        willOverwriteOld,
+        authOldPath,
+        metaOldPath
+    };
+}
+
 /** Deletes auth.json and auth-meta.json (full logout). */
-async function logout() {
-    await fs.remove(AUTH_FILE);
-    await fs.remove(AUTH_META_FILE);
+async function logout(authFilePath) {
+    const filePath = getAuthFilePath(authFilePath);
+    const metaPath = getAuthMetaFilePath(filePath);
+    
+    await fs.remove(filePath);
+    await fs.remove(metaPath);
 }
 
 /**
@@ -130,14 +197,21 @@ async function dismissFidoPage(page, logger) {
 }
 
 async function login(credentials = {}) {
-    const { email, password, targetUrl } = credentials;
+    const { email, password, targetUrl, authFile } = credentials;
     const isAutomated = !!(email && password);
     const headless = !credentials.notheadless && isAutomated;
     // Use targetUrl if provided, otherwise default to ONENOTE_URL for backward compatibility
     const finalTargetUrl = targetUrl || ONENOTE_URL;
 
+    // Get the auth file path (use provided or default)
+    const filePath = getAuthFilePath(authFile);
+    const metaPath = getAuthMetaFilePath(filePath);
+
     // Added to verify version on user's machine
     logger.debug('Authentication Module: Version 4.4-DEBUG starting...');
+
+    logger.debug(`Using auth file path: ${filePath}`);
+    logger.debug(`Using meta file path: ${metaPath}`);
 
     if (isAutomated) {
         logger.info(`Attempting automated login for ${email}...`);
@@ -147,6 +221,9 @@ async function login(credentials = {}) {
         const serviceName = finalTargetUrl.includes('outlook') ? 'Outlook' : 'OneNote';
         logger.warn(`The script will wait until you successfully reach the ${serviceName} interface.`);
     }
+    
+    // Prepare files (backup existing if needed, create directory)
+    await checkAndPrepareFiles(filePath);
 
     const browser = await chromium.launch({ headless: !!headless });
     const context = await browser.newContext({
@@ -570,14 +647,14 @@ async function login(credentials = {}) {
         }
 
         logger.info('Saving authentication state...');
-        await context.storageState({ path: AUTH_FILE });
+        await context.storageState({ path: filePath });
 
-        await fs.writeJson(AUTH_META_FILE, {
+        await fs.writeJson(metaPath, {
             email: email || 'manual login',
             loginTime: new Date().toISOString()
         });
 
-        logger.success(`Authentication successful! State saved to ${AUTH_FILE}`);
+        logger.success(`Authentication successful! State saved to ${filePath}`);
     } catch (error) {
         logger.error('Authentication failed or cancelled:', error);
         if (isAutomated) {
@@ -588,16 +665,19 @@ async function login(credentials = {}) {
     }
 }
 
-async function getAuthenticatedContext(browser) {
-    if (await fs.pathExists(AUTH_FILE)) {
-        return browser.newContext({ storageState: AUTH_FILE });
+async function getAuthenticatedContext(browser, authFilePath) {
+    const filePath = getAuthFilePath(authFilePath);
+    if (await fs.pathExists(filePath)) {
+        return browser.newContext({ storageState: filePath });
     } else {
         throw new Error('No authentication state found. Please run "login" command first.');
     }
 }
 
-async function checkAuth(targetUrl = ONENOTE_URL) {
-    if (!(await fs.pathExists(AUTH_FILE))) {
+async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
+    const filePath = getAuthFilePath(authFilePath);
+    
+    if (!(await fs.pathExists(filePath))) {
         return false;
     }
 
@@ -605,7 +685,7 @@ async function checkAuth(targetUrl = ONENOTE_URL) {
     try {
         logger.debug('Verifying authentication session...');
         browser = await chromium.launch({ headless: true });
-        const context = await browser.newContext({ storageState: AUTH_FILE });
+        const context = await browser.newContext({ storageState: filePath });
         const page = await context.newPage();
 
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -618,7 +698,7 @@ async function checkAuth(targetUrl = ONENOTE_URL) {
 
         if (isLoginUrl) {
             logger.warn('Authentication session has expired. Deleting stale auth state.');
-            await logout();
+            await logout(authFilePath);
             return false;
         }
 
