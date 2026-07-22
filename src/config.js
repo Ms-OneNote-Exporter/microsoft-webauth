@@ -4,24 +4,46 @@
  * @copyright 2026 phptr,enoola,msout
  */
 const path = require('path');
+const os = require('os');
+const fs = require('fs-extra');
 
 /**
- * Returns the directory where auth files (auth.json, auth-meta.json) are stored.
- * For this standalone CLI tool, we use the project root.
+ * Returns the default auth file path (~/.microsoft-webauth/auth-file.json)
  */
-function getUserDataDir() {
-    return path.resolve(__dirname, '..');
+function getDefaultAuthFilePath() {
+    const homeDir = os.homedir();
+    const appDir = path.join(homeDir, '.microsoft-webauth');
+    return path.join(appDir, 'auth-file.json');
 }
 
-const USER_DATA_DIR = getUserDataDir();
+/**
+ * Generates the meta file path from auth file path
+ * e.g., /path/to/auth-file.json -> /path/to/auth-file-meta.json
+ */
+function getAuthMetaFilePath(authFilePath) {
+    const dir = path.dirname(authFilePath);
+    const name = path.basename(authFilePath);
+    // Remove .json extension if present, then add -meta.json
+    const baseName = name.replace(/\.json$/, '');
+    return path.join(dir, `${baseName}-meta.json`);
+}
 
-const AUTH_FILE = path.join(USER_DATA_DIR, 'auth.json');
+/**
+ * Ensures the directory for the auth file exists, creates it if needed
+ */
+async function ensureAuthDir(authFilePath) {
+    const dir = path.dirname(authFilePath);
+    await fs.ensureDir(dir);
+}
+
+const DEFAULT_AUTH_FILE = getDefaultAuthFilePath();
 const ONENOTE_URL = 'https://onenote.cloud.microsoft/en-us';
 const OUTLOOK_URL = 'https://outlook.cloud.microsoft/mail/';
 
 module.exports = {
-    AUTH_FILE,
+    DEFAULT_AUTH_FILE,
+    getAuthMetaFilePath,
+    ensureAuthDir,
     ONENOTE_URL,
     OUTLOOK_URL,
-    USER_DATA_DIR,
 };

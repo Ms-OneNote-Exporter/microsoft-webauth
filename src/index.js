@@ -7,7 +7,7 @@
 const { program } = require('commander');
 const logger = require('./utils/logger');
 const { login, checkAuth, getAuthMeta, logout } = require('./auth');
-const { ONENOTE_URL, OUTLOOK_URL } = require('./config');
+const { DEFAULT_AUTH_FILE, ONENOTE_URL, OUTLOOK_URL } = require('./config');
 
 program
     .name('webauth')
@@ -22,6 +22,7 @@ program
     .option('--notheadless', 'Run in visible browser mode for debugging')
     .option('--dodump', 'Dump HTML content to files for debugging')
     .option('--against <target>', 'Target service: onenote (default) or outlook', 'onenote')
+    .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
         await login({ ...options, targetUrl });
@@ -31,12 +32,13 @@ program
     .command('check')
     .description('Check if authenticated')
     .option('--against <target>', 'Target service: onenote (default) or outlook', 'onenote')
+    .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
-        const isAuth = await checkAuth(targetUrl);
+        const isAuth = await checkAuth(targetUrl, options.authFile);
         if (isAuth) {
             logger.success('Authentication file found. You are authenticated.');
-            const meta = await getAuthMeta();
+            const meta = await getAuthMeta(options.authFile);
             if (meta && meta.email) {
                 const loginTime = new Date(meta.loginTime).toLocaleString();
                 logger.info(`Logged in as: ${meta.email}`);
@@ -50,8 +52,9 @@ program
 program
     .command('logout')
     .description('Clear authentication state')
-    .action(async () => {
-        await logout();
+    .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
+    .action(async (options) => {
+        await logout(options.authFile);
         logger.success('Logged out successfully. Authentication state cleared.');
     });
 

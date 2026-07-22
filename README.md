@@ -3,7 +3,7 @@
 A tool to authenticate against microsoft online (live or professionnal tenants)
 We do not rely on GraphAPI.
 
-e.g: 
+e.g:
   - https://onenote.cloud.microsoft/notebooks
   - https://outlook.live.com/mail/
   - and by extension https://login.microsoft.com
@@ -51,6 +51,12 @@ npm install @msout/microsoft-webauth
 microsoft-webauth login --email your@email.com --password yourpassword
 ```
 
+With custom auth file path:
+
+```bash
+microsoft-webauth login --email your@email.com --password yourpassword --auth-file /path/to/authfile.json
+```
+
 ### Login (Manual/Interactive)
 
 ```bash
@@ -59,16 +65,34 @@ microsoft-webauth login
 
 This will open a browser window. Log in manually, then press Enter when you see the notebooks list.
 
+With custom auth file path:
+
+```bash
+microsoft-webauth login --auth-file /path/to/authfile.json
+```
+
 ### Check Authentication Status
 
 ```bash
 microsoft-webauth check
 ```
 
+With custom auth file path:
+
+```bash
+microsoft-webauth check --auth-file /path/to/authfile.json
+```
+
 ### Logout
 
 ```bash
 microsoft-webauth logout
+```
+
+With custom auth file path:
+
+```bash
+microsoft-webauth logout --auth-file /path/to/authfile.json
 ```
 
 ## Options
@@ -79,12 +103,15 @@ microsoft-webauth logout
 | `--password <password>` | Microsoft account password (for automated login) |
 | `--notheadless` | Run in visible browser mode (disable headless) |
 | `--dodump` | Dump HTML content to files for debugging |
+| `--auth-file <path>` | Path to auth file (default: ~/.microsoft-webauth/auth-file.json) |
 
 ## Output
 
-Authentication state is saved to `auth.json` in the project directory. A metadata file `auth-meta.json` stores:
+Authentication state is saved to the specified auth file path. By default, it uses `~/.microsoft-webauth/auth-file.json`. A metadata file `{auth-file-prefix}-meta.json` stores:
 - Email used for login
 - Login timestamp
+
+When files already exist, they are automatically backed up with `.old` suffix. If `.old` files already exist, a warning is displayed before overwriting.
 
 ## Testing
 
