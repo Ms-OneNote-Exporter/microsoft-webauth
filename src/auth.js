@@ -6,7 +6,7 @@
 const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
-const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir } = require('./config');
+const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir, ONENOTE_URL } = require('./config');
 const path = require('path');
 const readline = require('readline');
 

@@ -2,12 +2,13 @@ const path = require('path');
 const fs = require('fs-extra');
 
 // Mock the modules before requiring auth
-jest.mock('../src/config', () => ({
-    AUTH_FILE: '/tmp/test-auth.json',
-    ONENOTE_URL: 'https://www.onenote.com/notebooks',
-    OUTLOOK_URL: 'https://outlook.cloud.microsoft/mail/',
-    USER_DATA_DIR: '/tmp'
-}));
+jest.mock('../src/config', () => {
+    const actual = jest.requireActual('../src/config');
+    return {
+        ...actual,
+        DEFAULT_AUTH_FILE: '/tmp/test-auth.json'
+    };
+});
 
 jest.mock('../src/utils/logger', () => ({
     info: jest.fn(),
@@ -117,18 +118,21 @@ describe('config', () => {
         fs.removeSync('/tmp/test-auth.json');
         fs.removeSync('/tmp/test-auth-meta.json');
         config = require('../src/config');
-        auth = require('../src/auth');
     });
 
-    it('should export AUTH_FILE', () => {
-        expect(config.AUTH_FILE).toBe('/tmp/test-auth.json');
+    it('should export DEFAULT_AUTH_FILE', () => {
+        expect(config.DEFAULT_AUTH_FILE).toBe('/tmp/test-auth.json');
     });
 
     it('should export ONENOTE_URL', () => {
-        expect(config.ONENOTE_URL).toBe('https://www.onenote.com/notebooks');
+        expect(config.ONENOTE_URL).toBe('https://onenote.cloud.microsoft/en-us');
     });
 
     it('should export OUTLOOK_URL', () => {
         expect(config.OUTLOOK_URL).toBe('https://outlook.cloud.microsoft/mail/');
+    });
+
+    it('should export getAuthMetaFilePath', () => {
+        expect(config.getAuthMetaFilePath('/tmp/test-auth.json')).toBe('/tmp/test-auth-meta.json');
     });
 });
