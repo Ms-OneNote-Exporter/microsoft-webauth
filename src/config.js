@@ -37,7 +37,7 @@ async function ensureAuthDir(authFilePath) {
 }
 
 const DEFAULT_AUTH_FILE = getDefaultAuthFilePath();
-const ONENOTE_URL = 'https://onenote.cloud.microsoft/en-us';
+const ONENOTE_URL = 'https://onenote.cloud.microsoft/notebooks';
 const OUTLOOK_URL = 'https://outlook.cloud.microsoft/mail/';
 
 module.exports = {
