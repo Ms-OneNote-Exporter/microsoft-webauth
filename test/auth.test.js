@@ -125,7 +125,7 @@ describe('config', () => {
     });
 
     it('should export ONENOTE_URL', () => {
-        expect(config.ONENOTE_URL).toBe('https://onenote.cloud.microsoft/en-us');
+        expect(config.ONENOTE_URL).toBe('https://onenote.cloud.microsoft/notebooks');
     });
 
     it('should export OUTLOOK_URL', () => {
