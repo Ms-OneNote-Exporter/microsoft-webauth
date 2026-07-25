@@ -130,15 +130,20 @@ async function waitForAuthSuccess(page, targetUrl) {
         ]);
         logger.success('Outlook mail interface detected.');
     } else {
-        // OneNote default behavior
-        logger.info('Waiting for redirection to notebooks list...');
+        // OneNote default behavior — wait for the authenticated notebooks interface.
+        // IMPORTANT: We must require /notebooks in the URL to avoid matching the
+        // unauthenticated marketing landing page (onenote.cloud.microsoft/en-us)
+        // which also matches the old hostname-only check and caused premature auth saving.
+        logger.info('Waiting for redirection to authenticated notebooks interface...');
         await Promise.any([
-            page.waitForURL(url => url.toString().includes('/notebooks') || url.hostname.includes('onenote.cloud.microsoft') || url.hostname.includes('onenote.com'), { timeout: 60000 }),
+            // Primary: URL must contain /notebooks (authenticated app)
+            page.waitForURL(url => url.toString().includes('/notebooks'), { timeout: 60000 }),
+            // Fallback UI elements that only appear when actually signed in
             page.waitForSelector('text="My notebooks"', { state: 'visible', timeout: 60000 }),
             page.waitForSelector('text="Create new notebook"', { state: 'visible', timeout: 60000 }),
-            page.waitForSelector('text="Welcome, "', { state: 'visible', timeout: 60000 })
+            page.waitForSelector('text="Welcome, "', { state: 'visible', timeout: 60000 }),
         ]);
-        logger.success('Notebooks list detected.');
+        logger.success('Authenticated notebooks interface detected.');
     }
 }
 
