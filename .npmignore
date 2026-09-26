@@ -1,7 +1,16 @@
 node_modules/
 *.tgz
 .env
-auth.json
-auth-meta.json
 logs
 test/
+
+# Auth state must never ship: these hold live session cookies and MSAL tokens.
+# Mirrors the *auth*json rule in .gitignore so removing this file cannot leak them.
+*auth*json
+auth.json
+auth-meta.json
+
+# Local tooling / CI config
+.qwen/
+.github/
+jest.config.js

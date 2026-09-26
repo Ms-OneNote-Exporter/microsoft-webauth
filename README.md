@@ -166,5 +166,5 @@ microsoft-webauth-playwright/
 
 ## License
 
-ISC — same as MSOneNote Exporter.
+MIT — see [LICENSE](LICENSE).
 

@@ -1,3 +1,4 @@
+const fs = require('fs');
 const { chromium } = require('playwright');
 
 jest.mock('../src/utils/logger', () => ({
@@ -12,6 +13,26 @@ jest.mock('../src/utils/logger', () => ({
 }));
 
 const { clearBlockingScreens } = require('../src/auth');
+
+/**
+ * These tests drive a real browser. This suite gates npm releases, so a missing
+ * browser (slim CI image, PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD) must skip rather
+ * than fail the build. executablePath() is resolved synchronously so the whole
+ * block can be marked skipped instead of failing test by test.
+ */
+const describeWithBrowser = (() => {
+    let executable = null;
+    try {
+        executable = chromium.executablePath();
+    } catch (_) {
+        // playwright could not resolve a path at all
+    }
+    if (!executable || !fs.existsSync(executable)) {
+        console.warn('Skipping blocking-screen tests: chromium is not installed. Run `npx playwright install chromium`.');
+        return describe.skip;
+    }
+    return describe;
+})();
 
 /**
  * These tests replay the two screens that actually block a real login, using the
@@ -78,7 +99,7 @@ const fidoHtml = page$('Sign in', `
 
 const oneNoteHtml = page$('OneNote', '<h1>My notebooks</h1>');
 
-describe('clearBlockingScreens', () => {
+describeWithBrowser('clearBlockingScreens', () => {
     let browser;
     let context;
     let page;

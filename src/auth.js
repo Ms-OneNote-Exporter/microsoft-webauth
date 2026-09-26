@@ -7,6 +7,7 @@ const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
 const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir, ONENOTE_URL } = require('./config');
+const { version: PKG_VERSION } = require('../package.json');
 const path = require('path');
 const readline = require('readline');
 
@@ -527,8 +528,9 @@ async function login(credentials = {}) {
     const filePath = getAuthFilePath(authFile);
     const metaPath = getAuthMetaFilePath(filePath);
 
-    // Added to verify version on user's machine
-    logger.debug('Authentication Module: Version 4.5-DEBUG starting...');
+    // Added to verify version on user's machine. Read from package.json so it
+    // cannot drift away from the published version.
+    logger.debug(`Authentication Module: v${PKG_VERSION} starting...`);
 
     logger.debug(`Using auth file path: ${filePath}`);
     logger.debug(`Using meta file path: ${metaPath}`);
