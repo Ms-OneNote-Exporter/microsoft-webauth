@@ -8,11 +8,12 @@ const { program } = require('commander');
 const logger = require('./utils/logger');
 const { login, checkAuth, getAuthMeta, logout } = require('./auth');
 const { DEFAULT_AUTH_FILE, ONENOTE_URL, OUTLOOK_URL } = require('./config');
+const { version: PKG_VERSION } = require('../package.json');
 
 program
     .name('webauth')
     .description('Microsoft web authentication via Playwright — extracted from MSOneNote Exporter')
-    .version('1.0.0');
+    .version(PKG_VERSION);
 
 program
     .command('login')
