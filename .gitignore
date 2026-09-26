@@ -4,6 +4,7 @@ node_modules/
 # Authentication files (DO NOT COMMIT)
 auth.json
 auth-meta.json
+*auth*json
 
 # Logs
 logs/

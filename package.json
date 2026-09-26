@@ -28,6 +28,7 @@
     "url": "git+https://github.com/Ms-OneNote-Exporter/microsoft-webauth.git"
   },
   "dependencies": {
+    "@msout/microsoft-webauth": "^0.0.9",
     "chalk": "^4.1.2",
     "commander": "^14.0.3",
     "fs-extra": "^11.3.3",
