@@ -155,6 +155,7 @@ async function waitForAuthSuccess(page, targetUrl) {
  *
  * @param {import('playwright').Page} page
  * @param {object} logger
+ * @returns {Promise<string|null>} 'Cancel' once dismissed, null if nothing was clickable
  */
 async function dismissFidoPage(page, logger) {
     // Try multiple selectors for the page-level Cancel button.
@@ -185,12 +186,18 @@ async function dismissFidoPage(page, logger) {
     if (!clicked) {
         // Last resort: JS click on any visible Cancel button
         logger.warn('FIDO: DOM selectors failed, trying JS click fallback...');
-        await page.evaluate(() => {
+        clicked = await page.evaluate(() => {
             const btns = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
             const cancel = btns.find(b => /^cancel$/i.test((b.textContent || b.value || '').trim()));
-            if (cancel) cancel.click();
+            if (cancel) {
+                cancel.click();
+                return true;
+            }
+            return false;
         });
     }
+
+    if (!clicked) return null;
 
     // Wait for navigation away from the FIDO page (up to 8 s)
     try {
@@ -199,6 +206,311 @@ async function dismissFidoPage(page, logger) {
     } catch (_) {
         logger.warn('FIDO: still on FIDO URL after Cancel — continuing anyway.');
     }
+
+    return 'Cancel';
+}
+
+/**
+ * Answers the "Stay signed in?" prompt with "Yes" and ticks "Don't show this
+ * again" so later logins skip the screen entirely.
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string|null>} 'Yes' once clicked, null if the prompt is absent
+ */
+async function dismissStaySignedIn(page) {
+    const staySignedIn = page.getByText(/Stay signed in?/i)
+        .or(page.locator('#KmsiDescription'))
+        .first();
+
+    if (!(await staySignedIn.isVisible().catch(() => false))) return null;
+
+    logger.info('Detected "Stay signed in?" prompt.');
+
+    const dontShowAgain = page.locator('input[name="DontShowAgain"], #KmsiCheckboxField').first();
+    if (await dontShowAgain.isVisible().catch(() => false)) {
+        logger.debug('Checking "Don\'t show this again" checkbox...');
+        await dontShowAgain.check().catch(() => { });
+    }
+
+    const yesButton = page.getByRole('button', { name: /^Yes$/i })
+        .or(page.locator('button[data-testid="primaryButton"]'))
+        .or(page.locator('#idSIButton9'))
+        .first();
+
+    logger.info('Clicking "Yes" to stay signed in...');
+    await yesButton.click({ timeout: 10000 });
+    return 'Yes';
+}
+
+/**
+ * Screens Microsoft injects in the middle of an otherwise successful login.
+ * They are full-page forms that hijack the navigation, so nothing after them
+ * (MFA checks, "Stay signed in?", the redirect to OneNote/Outlook) can be
+ * reached until they are dismissed. All of them are full-page forms that hijack
+ * the navigation, and all of them arrive *late* — typically 20-60 s after the
+ * password is accepted, once per account:
+ *
+ *   1. account.live.com/interrupt/credentialaction or /proofs/remind
+ *      "Is your security info still accurate?" -> Looks good! (proof freshness)
+ *   2. account.live.com/tou/accrue
+ *      "We're updating our terms" -> Next (Services Agreement update)
+ *   3. account.live.com/interrupt/passkey -> login.microsoft.com/consumers/fido/create
+ *      the passkey prompt -> Cancel
+ *   4. login.live.com/... "Stay signed in?" -> Yes
+ *
+ * Each entry carries the only action labels that may be pressed on it, so a
+ * broad label like "Yes" can never be pressed on a screen that does not offer it.
+ * Screens are matched on the URL *and/or* the heading, because Microsoft moves
+ * them between paths (and serves the same screen from several) over time.
+ */
+const BLOCKING_SCREENS = [
+    {
+        name: 'FIDO / passkey prompt',
+        match: state => /consumers\/fido\//i.test(state.url)
+            || /passkey/i.test(state.url)
+            || /passkey|security key/i.test(state.heading),
+        // Dedicated WebAuthn dismisser rather than a label match: the page-level
+        // "Cancel" is the only safe action and it also waits out the navigation.
+        handle: page => dismissFidoPage(page, logger)
+    },
+    {
+        name: 'Terms of Use / Services Agreement update',
+        match: state => /account\.live\.com\/tou\//i.test(state.url),
+        actions: /^(next|accept|i accept|i agree|agree|continue|finish|done)$/i
+    },
+    {
+        name: 'Microsoft consent prompt',
+        match: state => /consent\./i.test(state.url),
+        actions: /^(accept|i accept|i agree|agree|continue|next)$/i
+    },
+    {
+        name: 'Security info freshness check',
+        match: state => (/account\.live\.com\/(pf|proofs|interrupt)/i.test(state.url) && !/passkey/i.test(state.url))
+            || /is your security info still accurate/i.test(state.heading)
+            || /help protect your account/i.test(state.heading),
+        // "Update now" and "I don't have any of these" are deliberately absent:
+        // either would rewrite or wipe the account's recovery methods.
+        actions: /^(looks good!?|skip for now|skip|continue|next)$/i
+    },
+    {
+        name: '"Stay signed in?" prompt',
+        match: state => /stay signed in/i.test(state.heading) || /kmsi/i.test(state.url),
+        handle: page => dismissStaySignedIn(page)
+    },
+];
+
+/**
+ * Buttons that may carry an action label, most specific first. account.live.com
+ * renders its pages with Fluent UI, where the action is always the primary
+ * button; the plain selectors are the fallback for the older server-rendered
+ * account pages.
+ */
+const BLOCKING_SCREEN_BUTTONS = [
+    'button[data-testid="primaryButton"]',
+    'input[data-testid="primaryButton"]',
+    'button',
+    'input[type="submit"]',
+    'input[type="button"]',
+    '[role="button"]',
+    'a',
+];
+
+/** Do not re-click the same unchanged screen more often than this. */
+const BLOCKING_SCREEN_RETRY_MS = 10000;
+
+/** Returns the blocking-screen descriptor matching { url, heading }, or null. */
+function matchBlockingScreen(state) {
+    if (!state) return null;
+    for (const screen of BLOCKING_SCREENS) {
+        try {
+            if (screen.match(state)) return screen;
+        } catch (_) {
+            // A malformed heading/url must never abort the whole login.
+        }
+    }
+    return null;
+}
+
+/**
+ * Reads the current URL + heading of the page.
+ * Returns null while the document is being swapped (mid-navigation), so callers
+ * must retry rather than treat null as "no blocking screen".
+ * @param {import('playwright').Page} page
+ */
+async function readScreenState(page) {
+    try {
+        return await page.evaluate(() => {
+            const heading = document.querySelector('h1, [role="heading"], [data-testid="title"]');
+            return {
+                url: location.href,
+                heading: (heading ? heading.textContent : '').replace(/\s+/g, ' ').trim()
+            };
+        });
+    } catch (_) {
+        // Execution context destroyed while navigating — caller should retry.
+        return null;
+    }
+}
+
+/** Shortens a URL for logging: keeps host + path, drops the query string. */
+function shortUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return `${parsed.host}${parsed.pathname}`;
+    } catch (_) {
+        return url;
+    }
+}
+
+/**
+ * Stable identity of a screen: same URL + same heading means the same step.
+ * Used to tell a genuine step change from a re-render of the same page.
+ */
+function screenSignature(state) {
+    return state ? `${state.url}::${state.heading}` : null;
+}
+
+/** Reads the visible label of a button-like element. */
+async function readActionLabel(handle) {
+    const text = await handle.textContent().catch(() => '') || '';
+    const value = await handle.getAttribute('value').catch(() => '') || '';
+    return `${text} ${value}`.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Clicks the single accept/continue action on a blocking screen.
+ * Only labels accepted by *this* screen's `actions` regex are eligible, so a
+ * stray "Skip" in a footer or a "Yes" meant for a different screen is never
+ * pressed by mistake.
+ * @param {import('playwright').Page} page
+ * @param {RegExp} actions
+ * @returns {Promise<string|null>} the label that was clicked, or null
+ */
+async function clickBlockingScreenAction(page, actions) {
+    for (const selector of BLOCKING_SCREEN_BUTTONS) {
+        const buttons = page.locator(selector);
+        const count = await buttons.count().catch(() => 0);
+
+        for (let i = 0; i < Math.min(count, 30); i++) {
+            const button = buttons.nth(i);
+            if (!(await button.isVisible().catch(() => false))) continue;
+
+            const label = await readActionLabel(button);
+            if (!label || !actions.test(label)) continue;
+
+            await button.click({ timeout: 10000 });
+            return label;
+        }
+    }
+    return null;
+}
+
+/**
+ * Waits until the blocking screen actually moves on. The Terms of Use flow is a
+ * single-page app, so the URL stays put across steps and only the heading (or the
+ * presence of the button) changes — a navigation wait alone would always time out.
+ * @returns {Promise<string|null>} the new signature, or null on timeout
+ */
+async function waitForBlockingScreenChange(page, previousSignature, timeout) {
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+        await page.waitForTimeout(400).catch(() => {});
+
+        const state = await readScreenState(page);
+        if (!state) continue;                       // mid-navigation, keep polling
+        if (screenSignature(state) !== previousSignature) return screenSignature(state);
+    }
+    return null;
+}
+
+/**
+ * Clears every blocking screen currently in the way of the login.
+ *
+ * A single acceptance usually leads to one or two more (e.g. the Services
+ * Agreement summary, then a "Finish" confirmation), so this loops until the
+ * page is no longer a blocking screen. `progress` is shared with the caller so
+ * that repeated invocations from the watcher do not hammer an unchanged screen.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} [options]
+ * @param {{ signatures: Set<string>, lastClickAt: number }} [options.progress]
+ * @param {boolean} [options.dodump]
+ * @param {() => boolean} [options.shouldStop]
+ * @returns {Promise<{ handled: number, reason: string }>}
+ */
+async function clearBlockingScreens(page, options = {}) {
+    const {
+        progress = { signatures: new Set(), lastClickAt: 0 },
+        maxScreens = 5,
+        stateTimeout = 10000,
+        changeTimeout = 20000,
+        dodump = false,
+        shouldStop = null
+    } = options;
+
+    let handled = 0;
+
+    for (let i = 0; i < maxScreens; i++) {
+        if (shouldStop && shouldStop()) return { handled, reason: 'stopped' };
+
+        // The screen may still be loading; give it a bounded number of chances.
+        let state = null;
+        const stateDeadline = Date.now() + stateTimeout;
+        do {
+            state = await readScreenState(page);
+            if (!state) await page.waitForTimeout(500).catch(() => {});
+        } while (!state && Date.now() < stateDeadline && !(shouldStop && shouldStop()));
+
+        if (!state) return { handled, reason: 'unreadable' };
+        const signature = screenSignature(state);
+
+        const screen = matchBlockingScreen(state);
+        if (!screen) return { handled, reason: 'no_blocking_screen' };
+
+        // Never click the exact same screen twice in quick succession: the click
+        // either worked (signature changes) or the page is stuck, and a tight
+        // retry loop would only spam requests at Microsoft.
+        if (progress.signatures.has(signature)) {
+            if (Date.now() - progress.lastClickAt < BLOCKING_SCREEN_RETRY_MS) {
+                logger.debug(`Blocking screen unchanged since last attempt — not re-clicking.`);
+                return { handled, reason: 'unchanged' };
+            }
+        } else {
+            progress.signatures.add(signature);
+        }
+
+        logger.info(`Blocking screen detected: ${screen.name} (${shortUrl(state.url)}). Accepting it...`);
+
+        if (dodump) {
+            const dumpDir = await logger.getDumpDir();
+            const displayPath = logger.getDumpDisplayPath();
+            const debugFile = path.join(dumpDir, `debug_blocking_screen_${i + 1}.html`);
+            await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+            logger.debug(`[dodump] Blocking screen state dumped to ${displayPath}/debug_blocking_screen_${i + 1}.html`);
+        }
+
+        let label = null;
+        try {
+            label = screen.handle
+                ? await screen.handle(page)
+                : await clickBlockingScreenAction(page, screen.actions);
+        } catch (e) {
+            logger.debug(`Blocking screen click failed: ${e.message}`);
+        }
+
+        if (!label) {
+            logger.warn(`No acceptable action button found on "${screen.name}". Stopping.`);
+            return { handled, reason: 'no_action' };
+        }
+
+        handled++;
+        progress.lastClickAt = Date.now();
+        logger.debug(`Clicked "${label}" on ${screen.name}.`);
+
+        await waitForBlockingScreenChange(page, signature, changeTimeout);
+    }
+
+    return { handled, reason: 'max_screens' };
 }
 
 async function login(credentials = {}) {
@@ -207,13 +519,16 @@ async function login(credentials = {}) {
     const headless = !credentials.notheadless && isAutomated;
     // Use targetUrl if provided, otherwise default to ONENOTE_URL for backward compatibility
     const finalTargetUrl = targetUrl || ONENOTE_URL;
+    // Shared across every clearBlockingScreens() call in this login so a screen that
+    // never changes is clicked once, not once per polling round.
+    const blockerProgress = { signatures: new Set(), lastClickAt: 0 };
 
     // Get the auth file path (use provided or default)
     const filePath = getAuthFilePath(authFile);
     const metaPath = getAuthMetaFilePath(filePath);
 
     // Added to verify version on user's machine
-    logger.debug('Authentication Module: Version 4.4-DEBUG starting...');
+    logger.debug('Authentication Module: Version 4.5-DEBUG starting...');
 
     logger.debug(`Using auth file path: ${filePath}`);
     logger.debug(`Using meta file path: ${metaPath}`);
@@ -483,35 +798,21 @@ async function login(credentials = {}) {
                 logger.debug(`[dodump] Post-password state dumped to ${displayPath}/debug_after_password.html`);
             }
 
-            // 2.5b. Handle FIDO/security key page (login.microsoft.com/consumers/fido/create)
-            // The addInitScript above makes navigator.credentials.create() reject immediately,
-            // so the native OS WebAuthn dialog never appears. We only need to click the
-            // page-level "Cancel" button and wait for navigation away from the FIDO URL.
+            // 2.5a. Clear blocking screens (consent, proof freshness, FIDO, "Stay signed
+            // in?"). All of them hijack the navigation after the password is accepted.
+            // This first pass catches the ones that appear immediately; the watcher in
+            // step 4 covers the rest, which is where they usually turn up.
             try {
-                const currentUrl = page.url();
-                const onFidoPage = currentUrl.includes('/fido/');
-
-                if (onFidoPage) {
-                    logger.info(`Already on FIDO page (${currentUrl}). Clicking page-level Cancel...`);
-                    await dismissFidoPage(page, logger);
-                } else {
-                    // Race: either we navigate to fido, or 8 s passes (no fido page)
-                    const fidoHandled = await Promise.race([
-                        page.waitForURL(url => url.toString().includes('/fido/'), { timeout: 8000 })
-                            .then(async () => {
-                                logger.info(`Navigated to FIDO page: ${page.url()}. Dismissing...`);
-                                await dismissFidoPage(page, logger);
-                                return 'fido_cancelled';
-                            }),
-                        page.waitForTimeout(8000).then(() => 'no_fido'),
-                    ]);
-                    logger.debug(`FIDO check result: ${fidoHandled}`);
-                }
+                const cleared = await clearBlockingScreens(page, {
+                    progress: blockerProgress,
+                    dodump: credentials.dodump
+                });
+                logger.debug(`Blocking screen pass: handled=${cleared.handled} (${cleared.reason})`);
             } catch (e) {
-                logger.debug(`FIDO popup handler skipped: ${e.message}`);
+                logger.debug(`Blocking screen pass skipped: ${e.message}`);
             }
 
-            // 2.5. Handle post-password MFA/Verification if needed
+            // 2.5b. Handle post-password MFA/Verification if needed
             try {
                 const verificationScreen = await Promise.race([
                     page.waitForSelector('text="Verify your identity"', { timeout: 10000 }).then(() => 'verify'),
@@ -574,56 +875,42 @@ async function login(credentials = {}) {
                 logger.debug(`Post-password verification handling skipped or failed: ${e.message}`);
             }
 
-            // 2.7. Handle "Help protect your account" interrupt screen
-            try {
-                const interruptPrompt = page.getByText(/Help protect your account/i).first();
-                if (await interruptPrompt.isVisible({ timeout: 5000 }) || page.url().includes('account.live.com/interrupt/')) {
-                    logger.info('Detected "Help protect your account" interrupt screen.');
-                    const skipButton = page.getByRole('button', { name: /Skip for now/i })
-                        .or(page.getByText(/Skip for now/i))
-                        .first();
-                    if (await skipButton.isVisible()) {
-                        logger.info('Clicking "Skip for now"...');
-                        await skipButton.click();
-                    }
-                }
-            } catch (e) {
-                logger.debug(`Help protect your account interrupt screen did not appear: ${e.message}`);
-            }
-
-            // 3. Handle "Stay signed in?" prompt if it appears
-            try {
-                logger.debug('Checking for "Stay signed in?" prompt...');
-
-                const staySignedIn = page.getByText(/Stay signed in?/i)
-                    .or(page.locator('#KmsiDescription'))
-                    .first();
-
-                await staySignedIn.waitFor({ state: 'visible', timeout: 7000 });
-
-                logger.info('Detected "Stay signed in?" prompt.');
-
-                const dontShowAgain = page.locator('input[name="DontShowAgain"], #KmsiCheckboxField').first();
-                if (await dontShowAgain.isVisible()) {
-                    logger.debug('Checking "Don\'t show this again" checkbox...');
-                    await dontShowAgain.check().catch(() => { });
-                }
-
-                const yesButton = page.getByRole('button', { name: /^Yes$/i })
-                    .or(page.locator('button[data-testid="primaryButton"]'))
-                    .or(page.locator('#idSIButton9'))
-                    .first();
-
-                logger.info('Clicking "Yes" to stay signed in...');
-                await yesButton.click();
-            } catch (e) {
-                logger.debug(`Stay signed in prompt did not appear or was not recognized: ${e.message}`);
-            }
+            // 2.7/3. "Help protect your account", "Stay signed in?" and the FIDO page are
+            // all entries in the BLOCKING_SCREENS table: answered here, and again by the
+            // watcher in step 4 for the copies that arrive after this point.
 
             // 4. Wait for redirection to target interface (notebooks or mail)
+            // A consent screen can still show up after any of the steps above (e.g. a
+            // terms update queued behind "Stay signed in?"), so keep clearing them
+            // while we wait instead of only checking once up front.
+            let stopWatcher = false;
+            const blockerWatcher = (async () => {
+                while (!stopWatcher) {
+                    try {
+                        await clearBlockingScreens(page, {
+                            progress: blockerProgress,
+                            maxScreens: 2,
+                            shouldStop: () => stopWatcher
+                        });
+                    } catch (e) {
+                        logger.debug(`Blocking screen watcher error: ${e.message}`);
+                    }
+                    await page.waitForTimeout(1000).catch(() => {});
+                }
+            })();
+
             try {
-                await waitForAuthSuccess(page, finalTargetUrl);
+                await Promise.race([waitForAuthSuccess(page, finalTargetUrl), blockerWatcher]);
             } catch (e) {
+                // Name the screen we are stuck on: a plain timeout is the single most
+                // common report for this tool and "still on X" is what makes it fixable.
+                const stuck = await readScreenState(page);
+                if (stuck) {
+                    logger.error(`Timed out waiting for the authenticated interface. Still on ${shortUrl(stuck.url)} — heading: "${stuck.heading || '(none)'}"`);
+                    if (!matchBlockingScreen(stuck)) {
+                        logger.warn('That screen is not one this tool knows how to dismiss automatically.');
+                    }
+                }
                 if (credentials.dodump) {
                     const dumpDir = await logger.getDumpDir();
                     const displayPath = logger.getDumpDisplayPath();
@@ -632,6 +919,9 @@ async function login(credentials = {}) {
                     logger.error(`Success detection failed. HTML dumped to ${displayPath}/debug_login_error_success.html`);
                 }
                 throw e;
+            } finally {
+                stopWatcher = true;
+                await blockerWatcher;
             }
         } else {
             logger.warn('Login flow requires manual interaction.');
@@ -724,5 +1014,8 @@ module.exports = {
     getAuthenticatedContext,
     checkAuth,
     getAuthMeta,
-    logout
+    logout,
+    // Exported for tests: clears the consent/interrupt screens that Microsoft can
+    // inject mid-login (e.g. the Terms of Use update at account.live.com/tou/accrue).
+    clearBlockingScreens
 };

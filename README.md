@@ -18,6 +18,30 @@ This is a standalone CLI tool for authenticating with Microsoft accounts using P
 - Manual login in browser
 - MFA/2FA support (OTC codes, number matching)
 - Session persistence
+- The interstitial screens Microsoft injects mid-login (see below)
+
+## Interstitial screens
+
+Microsoft interrupts an otherwise successful login with full-page forms that
+take over the navigation. If they are not answered, the login silently hangs and
+ends in a timeout. These are handled automatically:
+
+| Screen | Action taken |
+|--------|--------------|
+| "We're updating our terms" (`account.live.com/tou/accrue`) | Next — accepts the updated Services Agreement |
+| "Is your security info still accurate?" (`account.live.com/interrupt/…`, `/proofs/remind`) | Looks good! — keeps existing recovery methods |
+| Passkey / security key prompt (`…/consumers/fido/create`) | Cancel |
+| "Stay signed in?" | Yes, with "don't show again" ticked |
+| Microsoft consent pages (`consent.microsoft.com`) | Accept / Continue |
+
+Each screen only accepts a fixed set of button labels, so nothing else on the
+page can be pressed by accident. In particular the tool never chooses "Update
+now" or "I don't have any of these" on the security-info screen, since both would
+change or delete the account's recovery methods.
+
+Note that accepting the Services Agreement is a real change to the account, and
+is done on your behalf. If you would rather see it, run without `--email` and
+`--password` and sign in manually.
 
 ## Why this project ?
 
