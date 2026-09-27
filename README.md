@@ -166,5 +166,5 @@ microsoft-webauth-playwright/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE), and read [NOTICE.md](NOTICE.md).
 
