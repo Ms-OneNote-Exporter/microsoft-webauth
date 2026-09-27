@@ -95,6 +95,66 @@ With custom auth file path:
 microsoft-webauth login --auth-file /path/to/authfile.json
 ```
 
+### Login (OAuth2 + PKCE) — experimental
+
+> **Status: experiment, not a replacement.** It is a separate subcommand so the
+> working password and manual flows above are never touched.
+
+```bash
+microsoft-webauth login-pkce --client-id <your-public-client-id>
+```
+
+Opens Microsoft's own sign-in page in your **system** browser. Your password is
+typed on Microsoft and is never seen by this tool. A local listener on
+`http://localhost:8400/callback` receives the authorization code, which is
+exchanged for tokens and written to `auth-file-token.json` with mode `600`.
+
+```bash
+# remote/headless box: print the URL instead of launching a browser
+microsoft-webauth login-pkce --client-id <id> --no-open-browser
+
+# or read the client id from the environment
+export MSOUT_CLIENT_ID=<your-public-client-id>
+microsoft-webauth login-pkce
+```
+
+| Option | Description |
+|--------|-------------|
+| `--client-id <id>` | Public client id (or set `MSOUT_CLIENT_ID`) |
+| `--tenant <t>` | `common` (default), `organizations`, `consumers`, or a tenant id |
+| `--scopes <list>` | Default: `openid profile email User.Read Notes.Read offline_access` |
+| `--redirect-uri <uri>` | Default: `http://localhost:8400/callback` (must be registered) |
+| `--token-file <path>` | Default: alongside the auth file, `auth-file-token.json` |
+| `--login-hint <email>` | Pre-fills the account picker |
+| `--timeout <seconds>` | Default: `300` |
+| `--no-open-browser` | Print the authorize URL instead of launching a browser |
+
+#### App registration (one-time setup)
+
+1. <https://portal.azure.com> -> **Microsoft Entra ID** -> **App registrations** -> **New registration**
+2. Name: anything, e.g. `webauth-pkce-test`
+3. **Supported account types:** *Accounts in any organizational directory and personal Microsoft accounts* (this is what makes tenant `common` work)
+4. **Redirect URI** platform: **Mobile and desktop applications**, value `http://localhost`
+   (Microsoft ignores the port for this platform; `8400` is just where this tool listens)
+5. Create, then copy the **Application (client) ID**
+
+No client secret is needed: that is the point of PKCE for a public client.
+
+#### What this does not do
+
+This flow produces **OAuth2/Graph tokens**. It does **not** produce a Playwright
+`storageState`, which is what `microsoft-onenote-list-notebooks` and
+`microsoft-onenote-export-notebook` require, because those drive the OneNote web
+SPA and authenticate with session cookies (`ESTSCS`/`MSPOR`), not bearer tokens.
+
+So after this login you will have a token file, but you will still need
+`microsoft-webauth login` to run the export tools. Whether a token can be
+exchanged into a usable web session is the open question this experiment exists
+to answer.
+
+Treat `*-token.json` as a password: the refresh token can mint access tokens
+until it is revoked. The tool writes it `600` and warns if the mode drifts.
+
 ### Check Authentication Status
 
 ```bash

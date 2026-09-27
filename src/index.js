@@ -7,6 +7,7 @@
 const { program } = require('commander');
 const logger = require('./utils/logger');
 const { login, checkAuth, getAuthMeta, logout } = require('./auth');
+const { loginWithPkce, DEFAULT_REDIRECT_URI, DEFAULT_TENANT, DEFAULT_SCOPES, DEFAULT_TIMEOUT_MS } = require('./pkce');
 const { DEFAULT_AUTH_FILE, ONENOTE_URL, OUTLOOK_URL } = require('./config');
 const { version: PKG_VERSION } = require('../package.json');
 
@@ -27,6 +28,37 @@ program
     .action(async (options) => {
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
         await login({ ...options, targetUrl });
+    });
+
+program
+    .command('login-pkce')
+    .description('Experimental: OAuth2 authorization-code + PKCE login (tokens, not Playwright session cookies)')
+    .option('--client-id <id>', 'Public client id of your app registration (or set MSOUT_CLIENT_ID)')
+    .option('--tenant <tenant>', `Directory tenant: common, organizations, consumers, or a tenant id`, DEFAULT_TENANT)
+    .option('--scopes <scopes>', 'Space-separated scopes', DEFAULT_SCOPES)
+    .option('--redirect-uri <uri>', 'Must be registered on the app', DEFAULT_REDIRECT_URI)
+    .option('--token-file <path>', `Where to write tokens (default: alongside the auth file, name-token.json)`)
+    .option('--auth-file <path>', 'Auth file, only used to derive the default token path', DEFAULT_AUTH_FILE)
+    .option('--login-hint <email>', 'Pre-fills the account picker')
+    .option('--timeout <seconds>', 'How long to wait for the sign-in redirect', String(Math.round(DEFAULT_TIMEOUT_MS / 1000)))
+    .option('--no-open-browser', 'Print the URL instead of opening a browser (remote/headless machines)')
+    .action(async (options) => {
+        try {
+            await loginWithPkce({
+                clientId: options.clientId || process.env.MSOUT_CLIENT_ID,
+                tenant: options.tenant,
+                scopes: options.scopes,
+                redirectUri: options.redirectUri,
+                tokenFile: options.tokenFile,
+                authFile: options.authFile,
+                loginHint: options.loginHint,
+                timeoutMs: parseInt(options.timeout, 10) * 1000,
+                openBrowser: options.openBrowser !== false,
+            });
+        } catch (e) {
+            logger.error('PKCE login failed:', e.message);
+            process.exit(1);
+        }
     });
 
 program

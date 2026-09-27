@@ -2,9 +2,12 @@
 node_modules/
 
 # Authentication files (DO NOT COMMIT)
+# A refresh token is password-equivalent: anyone who reads it can mint access
+# tokens as the signed-in user until it is revoked.
 auth.json
 auth-meta.json
 *auth*json
+*token*.json
 
 # Logs
 logs/
