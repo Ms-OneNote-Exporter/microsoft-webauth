@@ -212,11 +212,18 @@ function waitForAuthorizationCode({
             }
 
             // Bind the response to this request. Without this, any local process
-            // could feed us a code.
+            // could feed us a code, and a leftover tab from an earlier sign-in
+            // would be accepted as if it belonged to this one.
             if (state !== expectedState) {
                 res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(errorPage('State mismatch', 'The sign-in response did not match this request. Try again.'));
-                finish(reject, new Error('State mismatch: the callback did not originate from this sign-in attempt.'));
+                res.end(stateMismatchPage());
+                finish(reject, new Error([
+                    'State mismatch: the sign-in response did not match this request.',
+                    'Nothing was signed in and no token was issued.',
+                    'This is almost always a leftover browser tab: the sign-in you completed',
+                    'was started by an earlier run of this command. Close every Microsoft',
+                    'sign-in tab, then run the command once and finish the sign-in in the tab it opens.',
+                ].join('\n  ')));
                 return;
             }
 
@@ -394,6 +401,27 @@ function errorPage(title, detail) {
 <p>You can close this tab.</p></body>`;
 }
 
+/**
+ * The overwhelmingly common cause of a state mismatch is a stale tab, not an
+ * attack, so the page leads with the fix instead of the jargon.
+ * @returns {string}
+ */
+function stateMismatchPage() {
+    return `<!doctype html><meta charset="utf-8"><title>Start the sign-in again</title>
+<body style="font:16px system-ui;margin:4rem auto;max-width:34rem;line-height:1.5">
+<h1 style="font-size:1.4rem">This sign-in tab is out of date</h1>
+<p>The sign-in you just completed was started by an <strong>earlier run</strong> of the
+command, so this tool is not expecting it and has discarded it. Nothing was signed in
+and no token was issued.</p>
+<p>To continue:</p>
+<ol>
+  <li>Close every Microsoft sign-in tab in this browser.</li>
+  <li>Run the command again.</li>
+  <li>Finish the sign-in in the tab it opens, without opening a second one.</li>
+</ol>
+<p>You can close this tab.</p></body>`;
+}
+
 function successPage() {
     return `<!doctype html><meta charset="utf-8"><title>Signed in</title>
 <body style="font:16px system-ui;margin:4rem auto;max-width:34rem">
@@ -505,6 +533,9 @@ async function loginWithPkce({
     logger.info("A browser tab will open on Microsoft's own sign-in page.");
     logger.info('Your password is entered on Microsoft and is never seen by this tool.');
     logger.info(`Waiting for the redirect on ${redirectUri} (timeout ${Math.round(timeoutMs / 1000)}s)...`);
+    logger.warn('Complete the sign-in in the tab that opens below. If you left a Microsoft');
+    logger.warn('sign-in tab open from an earlier attempt, close it first: this run only');
+    logger.warn('accepts the response to the sign-in it starts now.');
 
     if (openBrowser) {
         await openInDefaultBrowser(authorizeUrl);

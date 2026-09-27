@@ -193,6 +193,28 @@ describe('waitForAuthorizationCode', () => {
         await assertion;
     });
 
+    // Regression: a leftover tab from an earlier run produces a well-formed state
+    // that simply is not this run's. The message has to name that cause, since
+    // "try again" alone left the real problem undiscovered.
+    test('explains the stale-tab cause and confirms nothing was signed in', async () => {
+        const pending = waitForAuthorizationCode({ redirectUri, expectedState: 'expected', timeoutMs: 5000 });
+        const assertion = expect(pending).rejects.toThrow(/earlier run/);
+        await new Promise((r) => setTimeout(r, 100));
+        const res = await fetch(`${redirectUri}?code=the-code&state=someOtherRun`);
+        const body = await res.text();
+        expect(body).toMatch(/out of date/);
+        expect(body).toMatch(/no token was issued/);
+        await assertion;
+    });
+
+    test('rejects a missing state as well as a wrong one', async () => {
+        const pending = waitForAuthorizationCode({ redirectUri, expectedState: 'expected', timeoutMs: 5000 });
+        const assertion = expect(pending).rejects.toThrow(/State mismatch/);
+        await new Promise((r) => setTimeout(r, 100));
+        await fetch(`${redirectUri}?code=the-code`);
+        await assertion;
+    });
+
     test('surfaces a denied consent as an error', async () => {
         const pending = waitForAuthorizationCode({ redirectUri, expectedState: 'st4te', timeoutMs: 5000 });
         const assertion = expect(pending).rejects.toThrow(/access_denied/);
