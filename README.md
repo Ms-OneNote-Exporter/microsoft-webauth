@@ -123,7 +123,7 @@ microsoft-webauth login-pkce
 | `--client-id <id>` | Public client id (or set `MSOUT_CLIENT_ID`) |
 | `--tenant <t>` | Must match the app registration. `consumers` for *Personal Microsoft accounts* (default for the setup above); `common` only for multi-tenant apps |
 | `--scopes <list>` | Default: `openid profile email User.Read Notes.Read offline_access` |
-| `--redirect-uri <uri>` | Default: `http://localhost:8400/callback` (must be registered) |
+| `--redirect-uri <uri>` | Default: `http://localhost:8400` — **no path** (see note) |
 | `--token-file <path>` | Default: alongside the auth file, `auth-file-token.json` |
 | `--login-hint <email>` | Pre-fills the account picker |
 | `--timeout <seconds>` | Default: `300` |
@@ -147,6 +147,20 @@ microsoft-webauth login-pkce
 5. Create, then copy the **Application (client) ID**
 
 No client secret is needed: that is the point of PKCE for a public client.
+
+##### Why the redirect URI has no path
+
+For an app registered under **Mobile and desktop applications** with
+`http://localhost`, Microsoft matches the redirect URI on **host and port only**.
+Any path component is rejected with:
+
+```
+invalid_request: The provided value for the input parameter 'redirect_uri' is not valid.
+```
+
+So use `http://localhost:8400`, **not** `http://localhost:8400/callback`. The port
+is free to vary; the path is not. `login-pkce` rejects a path locally before
+opening a browser, since Microsoft only reports the problem on the sign-in page.
 
 #### What this does not do
 

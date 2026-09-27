@@ -12,6 +12,8 @@ const {
     generateState,
     buildAuthorizeUrl,
     getEndpoints,
+    validateRedirectUri,
+    DEFAULT_REDIRECT_URI,
     decodeJwtClaims,
     waitForAuthorizationCode,
     saveTokenFile,
@@ -114,6 +116,45 @@ describe('buildAuthorizeUrl', () => {
         expect(() => buildAuthorizeUrl({ challenge: 'c', state: 's' })).toThrow(/clientId/);
         expect(() => buildAuthorizeUrl({ clientId: 'c', state: 's' })).toThrow(/challenge/);
         expect(() => buildAuthorizeUrl({ clientId: 'c', challenge: 'c' })).toThrow(/state/);
+    });
+});
+
+describe('validateRedirectUri', () => {
+    // Regression: the default once carried a "/callback" path, which Microsoft
+    // rejects for a native public client. The failure surfaced in the browser
+    // while the CLI waited, so it is now caught before the browser opens.
+    test('rejects a path, the shape that actually broke', () => {
+        const problem = validateRedirectUri('http://localhost:8400/callback');
+        expect(problem).toMatch(/must not contain a path/);
+        expect(problem).toMatch(/http:\/\/localhost:8400/);
+    });
+
+    test('accepts the default bare origin with a port', () => {
+        expect(validateRedirectUri('http://localhost:8400')).toBeNull();
+    });
+
+    test('accepts a bare origin with an explicit trailing slash', () => {
+        expect(validateRedirectUri('http://localhost:8400/')).toBeNull();
+    });
+
+    test('accepts a bare origin with no port', () => {
+        expect(validateRedirectUri('http://localhost')).toBeNull();
+    });
+
+    test('rejects a non-http scheme', () => {
+        expect(validateRedirectUri('ftp://localhost:8400')).toMatch(/must be http or https/);
+    });
+
+    test('rejects a query string', () => {
+        expect(validateRedirectUri('http://localhost:8400?a=1')).toMatch(/query string/);
+    });
+
+    test('rejects unparseable input', () => {
+        expect(validateRedirectUri('not a url')).toMatch(/not a valid URL/);
+    });
+
+    test('the shipped default has no path', () => {
+        expect(validateRedirectUri(DEFAULT_REDIRECT_URI)).toBeNull();
     });
 });
 

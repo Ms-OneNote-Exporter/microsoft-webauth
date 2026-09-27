@@ -28,7 +28,10 @@ const logger = require('./utils/logger');
 const { ensureAuthDir } = require('./config');
 
 const DEFAULT_PORT = 8400;
-const DEFAULT_REDIRECT_URI = `http://localhost:${DEFAULT_PORT}/callback`;
+// No path component: for an app registered as "Public client/native (mobile and
+// desktop)" with `http://localhost`, Microsoft matches on host and port only and
+// rejects any request carrying a path. The port is free to vary; the path is not.
+const DEFAULT_REDIRECT_URI = `http://localhost:${DEFAULT_PORT}`;
 // Matches the recommended app registration ("Personal Microsoft accounts"),
 // which is single-tenant and therefore consentable without a verified publisher.
 // A multi-tenant app ('common') would require Partner Network verification before
@@ -399,6 +402,45 @@ function successPage() {
 }
 
 /**
+ * Fails fast on a redirect URI shape that Microsoft will reject.
+ *
+ * A native/public client registered as `http://localhost` is matched on host
+ * and port only, so a path component is invalid. That rejection happens in the
+ * browser, after the CLI is already waiting on the callback, which otherwise
+ * means a silent multi-minute timeout with no explanation.
+ *
+ * @returns {string|null} an error message, or null when the URI is acceptable
+ */
+function validateRedirectUri(redirectUri) {
+    let url;
+    try {
+        url = new URL(redirectUri);
+    } catch {
+        return `Redirect URI is not a valid URL: ${redirectUri}`;
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        return `Redirect URI must be http or https, got "${url.protocol}".`;
+    }
+
+    // url.pathname is '/' for a bare origin and for an explicit "/".
+    if (url.pathname && url.pathname !== '/') {
+        return [
+            `Redirect URI must not contain a path (found "${url.pathname}").`,
+            'An app registered as "Public client/native (mobile and desktop)" with http://localhost',
+            'is matched on host and port only, so Microsoft rejects any path. Use',
+            `http://localhost:${url.port || DEFAULT_PORT} instead.`,
+        ].join('\n  ');
+    }
+
+    if (url.search) {
+        return `Redirect URI must not contain a query string (found "${url.search}").`;
+    }
+
+    return null;
+}
+
+/**
  * Runs the full authorization-code + PKCE login.
  *
  * Sequence: generate a verifier/challenge pair, open the authorize URL in the
@@ -433,6 +475,15 @@ async function loginWithPkce({
             'Missing client id. Pass --client-id <id> or set MSOUT_CLIENT_ID.\n' +
             'Register a public client (Mobile and desktop applications) at ' +
             'https://portal.azure.com -> Microsoft Entra ID -> App registrations -> New registration.'
+        );
+    }
+
+    const redirectProblem = validateRedirectUri(redirectUri);
+    if (redirectProblem) {
+        throw new Error(
+            `Invalid --redirect-uri.\n  ${redirectProblem}\n` +
+            'Microsoft validates this on the sign-in page, so a bad value shows up as a\n' +
+            'browser error while this command waits for a redirect that never arrives.'
         );
     }
 
@@ -514,6 +565,7 @@ module.exports = {
     generatePkcePair,
     generateState,
     buildAuthorizeUrl,
+    validateRedirectUri,
     openInDefaultBrowser,
     waitForAuthorizationCode,
     exchangeCodeForToken,
