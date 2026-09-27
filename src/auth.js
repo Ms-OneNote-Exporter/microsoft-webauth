@@ -514,6 +514,334 @@ async function clearBlockingScreens(page, options = {}) {
     return { handled, reason: 'max_screens' };
 }
 
+/* ------------------------------------------------------------------------- *
+ * "How do you want to sign in?" — the screens between email and password
+ *
+ * For a passwordless-enabled account, Microsoft serves this after the email
+ * step (captured in logs/dumps, PageID i5030):
+ *
+ *     <h1 data-testid="title">Get a code to sign in</h1>
+ *     <button type="submit" data-testid="primaryButton">Send code</button>
+ *     <span role="button" class="fui-Link" tabindex="0">Use your password</span>
+ *
+ * Note what is *not* there: an "Other ways to sign in" link. The password is
+ * only reachable via the "Use your password" link in the footer of that very
+ * screen, and it is a <span role="button">, not an <a>, so it only responds to
+ * real pointer events. The previous implementation assumed "Other ways to sign
+ * in" always came first: it waited 15 s for a link that does not exist, threw
+ * STUCK, swallowed it, and then let the password selector time out 30 s later.
+ * A ~45 s stall ending in a misleading "incorrect credentials" message.
+ *
+ * So instead of racing text selectors and betting on which one wins, the state
+ * is read from the DOM — what is actually on offer — and "Use your password" is
+ * pressed wherever it appears.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Label patterns for the sign-in-choice screens, as *source strings*: they are
+ * handed into page.evaluate(), where RegExp objects do not survive
+ * serialization and must be rebuilt on the far side.
+ */
+const SIGN_IN_LABELS = {
+    usePassword: 'use your password|use a password instead|use password instead|sign in with a password',
+    otherWays: 'other ways to sign in|sign in another way|look for another way|try another way',
+    // The list of methods, where "Password" is one entry among several.
+    passwordEntry: '^password$|use your password|use a password',
+    methodList: 'select a (?:sign-in |verification )?method|choose (?:a |another )?way to sign in|how do you want to sign in',
+    sendCode: 'send code|get a code to sign in|text me a code|email me a code',
+    approveApp: 'approve a request on my microsoft authenticator app|approve sign in request',
+    otcPrompt: 'enter (?:the )?code|type (?:the )?code|verification code',
+};
+
+/** Compiles a SIGN_IN_LABELS entry into an anchored, case-insensitive RegExp. */
+function signInLabel(key) {
+    return new RegExp(SIGN_IN_LABELS[key], 'i');
+}
+
+/** Selectors for anything on the page that can be clicked, on either UI generation. */
+const CLICKABLE_SELECTOR = 'a[href], button, input[type="submit"], input[type="button"], [role="button"], [role="link"]';
+
+/** The password box, on both the legacy and the Fluent sign-in pages. */
+const PASSWORD_FIELD_SELECTOR = 'input[name="passwd"], input[type="password"]';
+
+/**
+ * Reads what the current sign-in screen actually offers, in a single round trip.
+ *
+ * Everything is answered from one evaluate() so the reading is a consistent
+ * snapshot: seven separate locators would each sample the page at a slightly
+ * different moment, which is how a screen mid-navigation gets misclassified.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<object|null>} null while the document is being swapped
+ */
+async function readSignInState(page) {
+    try {
+        return await page.evaluate(labels => {
+            const visible = el => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return false;
+                const style = window.getComputedStyle(el);
+                return style.visibility !== 'hidden' && style.display !== 'none';
+            };
+
+            const labelOf = el => `${el.value || ''} ${el.textContent || ''}`.replace(/\s+/g, ' ').trim();
+
+            // True when a *control* carrying this label is on screen. Deliberately
+            // not a body-text search: prose mentioning "another way" must never
+            // be mistaken for the button that acts on it.
+            const offersAction = key => {
+                const rx = new RegExp(labels[key], 'i');
+                return Array.from(document.querySelectorAll(
+                    'a[href], button, input[type="submit"], input[type="button"], [role="button"], [role="link"]'
+                )).some(el => visible(el) && rx.test(labelOf(el)));
+            };
+
+            const headingEl = document.querySelector('h1, [role="heading"], [data-testid="title"]');
+            const body = document.body ? (document.body.innerText || '').replace(/\s+/g, ' ') : '';
+
+            return {
+                url: location.href,
+                heading: (headingEl ? headingEl.textContent : '').replace(/\s+/g, ' ').trim(),
+                // Still on the email form: the step after it has not rendered yet.
+                emailField: visible(document.querySelector('input[name="loginfmt"]')),
+                passwordField: visible(document.querySelector('input[name="passwd"], input[type="password"]')),
+                otcField: visible(document.querySelector('input[name="otc"], input[type="tel"]')),
+                usePassword: offersAction('usePassword'),
+                otherWays: offersAction('otherWays'),
+                sendCode: offersAction('sendCode') || new RegExp(labels.sendCode, 'i').test(body),
+                // Prose-only screens: read from the page text, nothing to click.
+                methodList: new RegExp(labels.methodList, 'i').test(body),
+                approveApp: new RegExp(labels.approveApp, 'i').test(body),
+                otcPrompt: new RegExp(labels.otcPrompt, 'i').test(body)
+            };
+        }, SIGN_IN_LABELS);
+    } catch (_) {
+        // Execution context destroyed mid-navigation — caller should retry.
+        return null;
+    }
+}
+
+/** True when the screen is one this handler knows how to act on. */
+function isActionableSignInState(state) {
+    if (!state || state.emailField) return false;
+    return !!(state.passwordField || state.usePassword || state.otherWays
+        || state.methodList || state.sendCode || state.approveApp || state.otcPrompt);
+}
+
+/** Identity of a sign-in screen, to tell a real step change from a re-render. */
+function signInStateSignature(state) {
+    if (!state) return null;
+    return [state.url, state.heading, state.passwordField, state.usePassword,
+        state.otherWays, state.methodList, state.sendCode, state.approveApp].join('::');
+}
+
+/**
+ * Polls until `accept` is satisfied or the timeout runs out.
+ * @returns {Promise<object|null>} the accepted state, else the last readable one
+ */
+async function waitForSignInState(page, timeout, accept = isActionableSignInState) {
+    const deadline = Date.now() + timeout;
+    let state = null;
+    do {
+        const read = await readSignInState(page);
+        if (read) {
+            state = read;
+            if (accept(read)) return read;
+        }
+        await page.waitForTimeout(400).catch(() => {});
+    } while (Date.now() < deadline);
+    // The last *readable* state, not whatever a mid-navigation read happened to
+    // return: null would discard the only evidence of why the step is stuck.
+    return state;
+}
+
+/**
+ * Clicks the control carrying a given label.
+ *
+ * The Fluent pages render links as <span role="button">, which only react to a
+ * real pointer event: a .click() on an ancestor wrapper fires nothing. So the
+ * lookup escalates from the most semantic to the most forceful, and the last
+ * step targets the *innermost* match rather than the first in document order.
+ *
+ * @param {import('playwright').Page} page
+ * @param {RegExp} rx
+ * @param {{ timeout?: number }} [options]
+ * @returns {Promise<string|null>} the label clicked, or null if nothing matched
+ */
+async function clickByLabel(page, rx, { timeout = 8000 } = {}) {
+    // Precise strategies first: they match on the accessible name, so they hit
+    // the control the user sees rather than a wrapper.
+    const precise = [
+        page.getByRole('button', { name: rx }),
+        page.getByRole('link', { name: rx })
+    ];
+
+    // Raced, not sequential: a control is a button on one screen generation and a
+    // link on the other, so trying them in turn means paying the full timeout on
+    // whichever role does not apply.
+    const hit = await Promise.any(
+        precise.map((locator, i) => locator.first().waitFor({ state: 'visible', timeout }).then(() => i))
+    ).catch(() => -1);
+
+    // getByText is the fuzzier fallback, and the JS click the forceful one.
+    if (hit < 0) {
+        try {
+            await page.getByText(rx).first().waitFor({ state: 'visible', timeout: Math.min(timeout, 2000) });
+            precise.push(page.getByText(rx));
+            hit = precise.length - 1;
+        } catch (_) { /* fall through to the JS click */ }
+    }
+
+    if (hit >= 0) {
+        const first = precise[hit].first();
+        try {
+            // Read the label *before* clicking. These controls navigate on click,
+            // and textContent() against a locator whose element the navigation just
+            // removed blocks for the full 30 s default timeout before rejecting —
+            // which is exactly the stall this function is meant to avoid.
+            const label = ((await first.textContent({ timeout: 2000 }).catch(() => '')) || '')
+                .replace(/\s+/g, ' ').trim();
+            await first.click({ timeout: Math.min(timeout, 5000) });
+            return label || '(clicked)';
+        } catch (_) {
+            // Found but not clickable — let the JS click have a go.
+        }
+    }
+
+    return await page.evaluate(({ selector, source }) => {
+        const rx = new RegExp(source, 'i');
+        const labelOf = el => `${el.value || ''} ${el.textContent || ''}`.replace(/\s+/g, ' ').trim();
+        const hits = Array.from(document.querySelectorAll(selector)).filter(el => rx.test(labelOf(el)));
+        // Innermost hit: an ancestor's textContent includes the descendant's, so
+        // the first match in document order is usually a wrapper whose click
+        // never reaches the handler the user can see.
+        const target = hits.find(el => !hits.some(other => other !== el && el.contains(other)));
+        if (!target) return null;
+        target.click();
+        return labelOf(target);
+    }, { selector: CLICKABLE_SELECTOR, source: rx.source }).catch(() => null);
+}
+
+/**
+ * Presses the sign-in submit control.
+ *
+ * The legacy pages use <input type="submit" value="Sign in">, where the label
+ * lives in `value` and `filter({ hasText })` can never match it; the Fluent pages
+ * use <button type="submit" data-testid="primaryButton">Sign in</button>. Matching
+ * on the accessible role name covers both.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<boolean>} true if a submit control was clicked
+ */
+async function submitSignInForm(page) {
+    const strategies = [
+        page.getByRole('button', { name: /^(sign in|next|finish|continue)$/i }),
+        page.locator('input[type="submit"]'),
+        page.locator('button[type="submit"]')
+    ];
+
+    for (const locator of strategies) {
+        const button = locator.first();
+        if (!(await button.isVisible().catch(() => false))) continue;
+        // click() waits for the element to become enabled, which covers the
+        // short window after fill() while the page validates the password.
+        await button.click({ timeout: 10000 });
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Walks the "how do you want to sign in?" screens and lands on the password box.
+ *
+ * Prefers "Use your password" wherever it is offered, because on the
+ * passwordless screen that link is the only route to the password — there is no
+ * "Other ways to sign in" step to go through first. Only falls back to that
+ * step when the screen really does present it, then picks "Password" out of the
+ * resulting method list.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} [options]
+ * @param {number} [options.maxSteps]
+ * @param {number} [options.stateTimeout]   how long to wait for the first screen
+ * @param {number} [options.transitionTimeout] how long to wait after each click
+ * @param {boolean} [options.dodump]
+ * @param {string} [options.dumpFile]        basename written under the dump dir
+ * @returns {Promise<{ reached: boolean, reason: string, steps: number, state: object|null }>}
+ */
+async function reachPasswordScreen(page, options = {}) {
+    const {
+        maxSteps = 4,
+        stateTimeout = 15000,
+        transitionTimeout = 10000,
+        dodump = false,
+        dumpFile = 'debug_intermediate_screen'
+    } = options;
+
+    let state = await waitForSignInState(page, stateTimeout);
+    let dumped = false;
+
+    for (let steps = 0; steps < maxSteps; steps++) {
+        if (!state || !isActionableSignInState(state)) {
+            return { reached: false, reason: 'unreadable', steps, state };
+        }
+
+        if (state.passwordField) {
+            logger.debug(`Password field reached after ${steps} step(s).`);
+            return { reached: true, reason: 'password_field', steps, state };
+        }
+
+        if (dodump && !dumped) {
+            dumped = true;
+            const dir = await logger.getDumpDir();
+            await fs.writeFile(path.join(dir, `${dumpFile}.html`),
+                await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+            logger.debug(`[dodump] Intermediate screen state dumped to ${logger.getDumpDisplayPath()}/${dumpFile}.html`);
+        }
+
+        const before = signInStateSignature(state);
+        let clicked = null;
+
+        if (state.usePassword) {
+            logger.info('Password is offered on this screen — clicking "Use your password"...');
+            clicked = await clickByLabel(page, signInLabel('usePassword'));
+        } else if (state.otherWays) {
+            logger.info('Opening "Other ways to sign in"...');
+            clicked = await clickByLabel(page, signInLabel('otherWays'));
+        } else if (state.methodList) {
+            logger.info('Choosing "Password" from the sign-in method list...');
+            clicked = await clickByLabel(page, signInLabel('passwordEntry'));
+        }
+
+        if (!clicked) {
+            // No route to a password from here. Say which kind of screen it is,
+            // so a mandatory code/approval is not reported as a bad password.
+            const reason = state.approveApp ? 'approver_prompt'
+                : state.otcPrompt || state.sendCode || state.otcField ? 'code_prompt'
+                    : 'no_password_route';
+            logger.warn(`No way to reach the password screen from "${state.heading || shortUrl(state.url)}" (${reason}).`);
+            return { reached: false, reason, steps, state };
+        }
+
+        logger.debug(`Clicked "${clicked}". Waiting for the next screen...`);
+
+        // Wait for a *different* screen, not just the password box: the method
+        // list is a legitimate hop in the middle of this walk, and waiting only
+        // for the password field would burn the whole timeout on it. The
+        // signature guard keeps the not-yet-navigated pre-click state from
+        // satisfying the wait immediately.
+        state = await waitForSignInState(page, transitionTimeout,
+            s => s.passwordField || (isActionableSignInState(s) && signInStateSignature(s) !== before));
+        if (state && signInStateSignature(state) === before) {
+            logger.warn(`Screen did not change after clicking "${clicked}".`);
+            return { reached: false, reason: 'unchanged', steps, state };
+        }
+    }
+
+    return { reached: false, reason: 'max_steps', steps: maxSteps, state };
+}
+
 async function login(credentials = {}) {
     const { email, password, targetUrl, authFile } = credentials;
     const isAutomated = !!(email && password);
@@ -643,137 +971,56 @@ async function login(credentials = {}) {
                 logger.debug(`[dodump] Post-email state dumped to ${displayPath}/debug_after_email.html`);
             }
 
-            // 1.5. Handle intermediate screens (MFA selection, "Other ways to sign in")
+            // 1.5. Get from the email step to the password box. This screen has
+            // no "Other ways to sign in" step on it — the "Use your password" link
+            // in its footer is the only route to the password — so the state is
+            // read from the DOM rather than guessed from a race between text
+            // selectors. See reachPasswordScreen() above.
             try {
-                const pageTitle = (await page.title()).trim();
-                const pageHeading = (await page.locator('h1, [role="heading"]').first().textContent().catch(() => '')).trim();
+                const nav = await reachPasswordScreen(page, { dodump: credentials.dodump });
 
-                logger.debug(`Settled State: Title="${pageTitle}" | Heading="${pageHeading}"`);
-                logger.debug('Checking for intermediate MFA/Sign-in option screens...');
-
-                const result = await Promise.race([
-                    page.waitForSelector('text=/Other ways to sign in/i', { state: 'visible', timeout: 15000 }).then(() => 'other_ways'),
-                    page.waitForSelector('text=/Get a code to sign in/i', { state: 'visible', timeout: 15000 }).then(() => 'other_ways'),
-                    page.waitForSelector('text=/Verify your identity/i', { state: 'visible', timeout: 15000 }).then(() => 'other_ways'),
-                    page.waitForSelector('text=/Use your password/i', { state: 'visible', timeout: 15000 }).then(() => 'use_password'),
-                    page.waitForSelector('text=/Approve a request on my Microsoft Authenticator app/i', { state: 'visible', timeout: 5000 }).then(() => 'approve_app'),
-                    page.waitForSelector('input[name="passwd"]', { state: 'visible', timeout: 15000 }).then(() => 'password'),
-                    page.waitForFunction(() => {
-                        const h = document.querySelector('h1, [role="heading"]')?.textContent || '';
-                        return h.includes('Get a code') || h.includes('Verify your identity');
-                    }, { timeout: 15000 }).then(() => 'other_ways'),
-                ]).catch((err) => {
-                    logger.debug(`Detection race timed out or failed: ${err.message}`);
-                    return 'timeout';
-                });
-
-                logger.debug(`Intermediate screen detection result: ${result}`);
-
-                if (credentials.dodump) {
-                    const dumpDir = await logger.getDumpDir();
-                    const displayPath = logger.getDumpDisplayPath();
-                    const debugFile = path.join(dumpDir, 'debug_intermediate_screen.html');
-                    await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
-                    logger.debug(`[dodump] Intermediate screen state dumped to ${displayPath}/debug_intermediate_screen.html`);
+                logger.debug(`Sign-in method step: reached=${nav.reached} (${nav.reason}) after ${nav.steps} step(s)`);
+                if (nav.state) {
+                    logger.debug(`Current screen: ${shortUrl(nav.state.url)} — heading: "${nav.state.heading || '(none)'}"`);
                 }
 
-                if (result === 'other_ways' || pageHeading.includes('Get a code') || pageHeading.includes('Verify your identity')) {
-                    logger.info('Detected MFA/Verification screen. Attempting to locate "Other ways to sign in"...');
-
-                    const otherWays = page.getByRole('button', { name: /Other ways to sign in|Sign in another way/i })
-                        .or(page.getByText(/Other ways to sign in|Sign in another way/i))
-                        .first();
-
-                    try {
-                        logger.debug('Waiting for "Other ways" link to appear in DOM...');
-                        await otherWays.waitFor({ state: 'attached', timeout: 15000 });
-
-                        const isVisible = await otherWays.isVisible();
-                        logger.debug(`"Other ways" link visibility: ${isVisible}`);
-
-                        logger.info('Clicking "Other ways to sign in"...');
-                        try {
-                            await otherWays.click({ timeout: 5000 });
-                        } catch (e) {
-                            logger.debug(`Standard click failed, trying forced: ${e.message}`);
-                            await otherWays.click({ force: true, timeout: 5000 });
-                        }
-                    } catch (e) {
-                        logger.warn(`MFA link interaction failed: ${e.message}`);
-
-                        logger.debug('Attempting final fallback: JavaScript-based click...');
-                        const clicked = await page.evaluate(() => {
-                            const elements = Array.from(document.querySelectorAll('span, a, button'));
-                            const target = elements.find(el =>
-                                el.textContent.toLowerCase().includes('other ways to sign in') ||
-                                el.textContent.toLowerCase().includes('sign in another way')
-                            );
-                            if (target) {
-                                target.click();
-                                return true;
-                            }
-                            return false;
-                        });
-
-                        if (clicked) {
-                            logger.info('Successfully triggered click via JavaScript fallback.');
-                        } else if (pageHeading.includes('Get a code')) {
-                            throw new Error('STUCK: "Other ways to sign in" link not found even via JS scan.');
-                        }
-                    }
-
-                    logger.debug('Waiting for method selection screen ("Use your password")...');
-                    const subResult = await Promise.race([
-                        page.waitForSelector('text=/Use your password/i', { state: 'visible', timeout: 15000 }).then(() => 'use_password'),
-                        page.waitForSelector('#idA_PWD_SwitchToPassword', { state: 'visible', timeout: 15000 }).then(() => 'use_password'),
-                        page.waitForSelector('text=/Select a verification method/i', { state: 'visible', timeout: 15000 }).then(() => 'other_ways_list'),
-                    ]).catch(() => 'timeout');
-
-                    logger.debug(`Sub-screen detection result: ${subResult}`);
-
-                    if (subResult === 'use_password') {
-                        logger.info('Selecting "Use your password" option...');
-                        await page.click('text=/Use your password/i');
-                    } else if (subResult === 'other_ways_list') {
-                        logger.info('Selection list detected. Looking for "Password"...');
-                        await page.click('text=/Password|Use your password/i');
-                    }
-                } else if (result === 'use_password') {
-                    logger.info('Detected "Use your password" option. Clicking...');
-                    await page.click('text="Use your password"');
-                } else if (result === 'approve_app') {
-                    logger.warn('MFA notification already sent. Attempting to switch to password...');
-                    const otherLink = page.locator('text="Other ways to sign in", #signInAnotherWay').first();
-                    if (await otherLink.isVisible()) {
-                        await otherLink.click();
-                        await page.waitForSelector('text="Use your password"', { state: 'visible', timeout: 10000 });
-                        await page.click('text="Use your password"');
-                    }
-                } else if (result === 'password') {
-                    logger.debug('Direct password field detected.');
-                } else if (result === 'timeout') {
-                    logger.debug('No intermediate screen detected within timeout. Proceeding to password entry.');
+                if (!nav.reached && nav.reason === 'code_prompt') {
+                    logger.warn('Microsoft is asking for a verification code instead of a password. This account cannot finish a password-only login.');
                 }
             } catch (e) {
-                logger.debug(`Intermediate screen handler encountered a fatal issue: ${e.message}`);
+                // Never fatal: step 2 still waits for the password box and reports
+                // precisely which screen is in the way if it is not there.
+                logger.debug(`Sign-in method step skipped: ${e.message}`);
             }
 
             // 2. Enter Password
             try {
-                await page.waitForSelector('input[name="passwd"]', { state: 'visible', timeout: 30000 });
-                await page.fill('input[name="passwd"]', password);
-
-                const submitButton = page.locator('input[type="submit"], button[type="submit"]').filter({ hasText: /Sign in|Next|Finish/i }).first();
-
-                logger.debug('Waiting for submit button to be enabled...');
-                await submitButton.waitFor({ state: 'visible', timeout: 10000 });
-                if (await submitButton.isDisabled()) {
-                    logger.debug('Submit button is disabled. It might be the wrong one or the password field is not considered filled.');
-                    logger.info('Will wait 1 seconds to let the submit button load properly');
-                    await page.waitForTimeout(1000);
+                const passwordField = page.locator(PASSWORD_FIELD_SELECTOR).first();
+                try {
+                    await passwordField.waitFor({ state: 'visible', timeout: 30000 });
+                } catch (e) {
+                    // "page.waitForSelector: Timeout 30000ms exceeded" is the least
+                    // actionable error this tool can emit, and it is what a
+                    // passwordless screen used to produce. Name the screen instead.
+                    const stuck = await readSignInState(page) || await readScreenState(page);
+                    if (stuck) {
+                        const needsCode = stuck.sendCode || stuck.approveApp || stuck.otcPrompt;
+                        throw new Error(
+                            `Password field never appeared. Still on ${shortUrl(stuck.url)} — heading: "${stuck.heading || '(none)'}".` +
+                            (needsCode
+                                ? ' Microsoft is offering a code/phone approval here, not a password.'
+                                : ' This screen does not offer a password sign-in.')
+                        );
+                    }
+                    throw e;
                 }
 
-                await submitButton.click();
+                await passwordField.fill(password);
+
+                logger.debug('Submitting the sign-in form...');
+                if (!(await submitSignInForm(page))) {
+                    throw new Error('Password filled but no sign-in submit control was found.');
+                }
 
                 const passwordError = page.locator('#passwordError');
                 if (await passwordError.isVisible({ timeout: 2000 })) {
@@ -816,12 +1063,15 @@ async function login(credentials = {}) {
 
             // 2.5b. Handle post-password MFA/Verification if needed
             try {
+                // ".displaySign" is the legacy number-match element; the Fluent
+                // pages put the same number under a data-testid instead.
+                const NUMBER_MATCH = '.displaySign, [data-testid="displaySign"]';
                 const verificationScreen = await Promise.race([
                     page.waitForSelector('text="Verify your identity"', { timeout: 10000 }).then(() => 'verify'),
                     page.waitForSelector('text="Enter code"', { timeout: 10000 }).then(() => 'enter_code'),
                     page.waitForSelector('input[name="otc"]', { timeout: 10000 }).then(() => 'otc_input'),
                     page.waitForSelector('text=/Approve sign in request/i', { timeout: 10000 }).then(() => 'number_match'),
-                    page.waitForSelector('.displaySign', { timeout: 10000 }).then(() => 'number_match'),
+                    page.waitForSelector(NUMBER_MATCH, { timeout: 10000 }).then(() => 'number_match'),
                 ]).catch(() => null);
 
                 if (credentials.dodump) {
@@ -837,20 +1087,20 @@ async function login(credentials = {}) {
 
                     let matchNumber = '??';
                     try {
-                        matchNumber = await page.$eval('.displaySign', el => el.textContent.trim());
+                        matchNumber = await page.locator(NUMBER_MATCH).first().textContent().catch(() => null) || '??';
                     } catch (_) {
-                        logger.debug('Could not extract number from .displaySign — user may still see it if --notheadless is used.');
+                        logger.debug('Could not extract the number-match code — user may still see it if --notheadless is used.');
                     }
 
                     logger.step('══════════════════════════════════════════════════════');
                     logger.step(`  ACTION REQUIRED: Open Microsoft Authenticator on your phone.`);
-                    logger.step(`  Enter the number:  ${matchNumber}`);
+                    logger.step(`  Enter the number:  ${matchNumber.trim()}`);
                     logger.step(`  Then tap "Yes" / "Approve" in the app.`);
                     logger.step('══════════════════════════════════════════════════════');
                     logger.info('Waiting for phone approval (up to 120 seconds)...');
 
                     await Promise.race([
-                        page.waitForSelector('.displaySign', { state: 'hidden', timeout: 120000 }),
+                        page.waitForSelector(NUMBER_MATCH, { state: 'hidden', timeout: 120000 }),
                         page.waitForURL(url => !url.toString().includes('login.microsoftonline.com'), { timeout: 120000 }),
                         page.waitForSelector('text=/Stay signed in/i', { timeout: 120000 }),
                     ]);
@@ -871,7 +1121,9 @@ async function login(credentials = {}) {
                         await page.locator('input[type="text"]:visible, input[type="tel"]:visible').first().fill(code);
                     }
 
-                    await page.click('input[type="submit"]');
+                    if (!(await submitSignInForm(page))) {
+                        logger.debug('No submit control found on the verification screen.');
+                    }
                 }
             } catch (e) {
                 logger.debug(`Post-password verification handling skipped or failed: ${e.message}`);
@@ -1019,5 +1271,12 @@ module.exports = {
     logout,
     // Exported for tests: clears the consent/interrupt screens that Microsoft can
     // inject mid-login (e.g. the Terms of Use update at account.live.com/tou/accrue).
-    clearBlockingScreens
+    clearBlockingScreens,
+    // Exported for tests: walks the "how do you want to sign in?" screens
+    // (passwordless "Get a code to sign in", "Other ways to sign in", method
+    // list) and lands on the password box.
+    reachPasswordScreen,
+    // Exported for tests: presses the sign-in submit control on both the legacy
+    // (<input type="submit" value="Sign in">) and Fluent (<button>) pages.
+    submitSignInForm
 };
