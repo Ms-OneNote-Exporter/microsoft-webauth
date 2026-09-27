@@ -483,10 +483,7 @@ async function clearBlockingScreens(page, options = {}) {
         logger.info(`Blocking screen detected: ${screen.name} (${shortUrl(state.url)}). Accepting it...`);
 
         if (dodump) {
-            const dumpDir = await logger.getDumpDir();
-            const displayPath = logger.getDumpDisplayPath();
-            const debugFile = path.join(dumpDir, `debug_blocking_screen_${i + 1}.html`);
-            await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+            const displayPath = await dumpPage(page, `debug_blocking_screen_${i + 1}.html`);
             logger.debug(`[dodump] Blocking screen state dumped to ${displayPath}/debug_blocking_screen_${i + 1}.html`);
         }
 
@@ -794,10 +791,8 @@ async function reachPasswordScreen(page, options = {}) {
 
         if (dodump && !dumped) {
             dumped = true;
-            const dir = await logger.getDumpDir();
-            await fs.writeFile(path.join(dir, `${dumpFile}.html`),
-                await page.content().catch(e => `<!-- Error: ${e.message} -->`));
-            logger.debug(`[dodump] Intermediate screen state dumped to ${logger.getDumpDisplayPath()}/${dumpFile}.html`);
+            const displayPath = await dumpPage(page, `${dumpFile}.html`);
+            logger.debug(`[dodump] Intermediate screen state dumped to ${displayPath}/${dumpFile}.html`);
         }
 
         const before = signInStateSignature(state);
@@ -840,6 +835,93 @@ async function reachPasswordScreen(page, options = {}) {
     }
 
     return { reached: false, reason: 'max_steps', steps: maxSteps, state };
+}
+
+/**
+ * Writes the current page to a debug dump, with credentials removed.
+ *
+ * `--dodump` calls page.content(), and that serialises the *live value* of every
+ * form control. On the page where the password is typed that means the user's
+ * actual Microsoft password lands on disk in cleartext:
+ *
+ *     <input type="password" name="passwd" value="the-real-password">
+ *
+ * The dumps are gitignored and never packed, but they land in the working
+ * tree, where backups, sync clients and file-sharing will pick them up, and
+ * they get pasted into issues and chat. Every dump goes through here so the
+ * redaction cannot be forgotten at the next call site.
+ *
+ * The scrubbing happens on a *clone* of the document rather than by rewriting
+ * the HTML string: PPFT and the other flow tokens are the values the login
+ * form is about to POST, so blanking them in the live DOM would break the very
+ * login being debugged. A clone cannot affect the page.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} fileName  basename, e.g. debug_after_password.html
+ */
+async function dumpPage(page, fileName) {
+    const dumpDir = await logger.getDumpDir();
+    const displayPath = logger.getDumpDisplayPath();
+    await fs.writeFile(path.join(dumpDir, fileName), await redactedPageContent(page));
+    return displayPath;
+}
+
+/** Placeholder written over any redacted value, so a scrubbed dump is obvious. */
+const REDACTED = '[redacted]';
+
+/**
+ * Serialises the page with credential-bearing control values blanked.
+ *
+ * Redacted: every `input[type=password]` whatever it is named, plus any control
+ * whose name or id reads as a credential or a bearer token — PPFT and the other
+ * pre-auth flow tokens, id/access/refresh tokens, secrets, and OTP / one-time
+ * code fields.
+ *
+ * Deliberately *not* redacted: the account identifier (`loginfmt`, `login`).
+ * It is already written in cleartext by the "Attempting automated login for
+ * <email>" line and is on the command line, so hiding it in the HTML would
+ * protect nothing while removing the one field worth having when a login fails
+ * on the wrong account.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<string>}
+ */
+async function redactedPageContent(page) {
+    return await page.evaluate(REDACTED => {
+        // Any control whose name or id holds a credential or a bearer token
+        // rather than UI state. Substring matching on purpose: these names are
+        // compound in the wild (otc, otcFallback, verificationCode, srfSFT) and
+        // an anchored pattern misses all but the exact spelling. Over-redacting
+        // one extra field costs a debug dump nothing; under-redacting leaks a
+        // credential. PPFT is Microsoft's pre-auth flow token and matches no
+        // generic word, so it is named outright.
+        const SENSITIVE = /ppft|token|canary|secret|passw|credential|otp|otc|code$|pin$/i;
+
+        const isSensitive = el => {
+            if (String(el.type || '').toLowerCase() === 'password') return true;
+            return SENSITIVE.test(`${el.name || ''}`.trim()) || SENSITIVE.test(`${el.id || ''}`.trim());
+        };
+
+        const clone = document.documentElement.cloneNode(true);
+        for (const el of clone.querySelectorAll('input, textarea')) {
+            // Only a value that is actually there needs hiding.
+            if (!el.value || !isSensitive(el)) continue;
+
+            if (el.tagName === 'TEXTAREA') {
+                el.textContent = REDACTED;
+            } else {
+                // setAttribute, never `.value =`. Assigning the IDL property on a
+                // *visible* input puts the element into "dirty value mode": the IDL
+                // value changes but the content attribute is left alone, and
+                // outerHTML serialises the content attribute — so the secret comes
+                // out unchanged. Only type="hidden" inputs are saved by that
+                // accident, and a password field is a visible input, which is
+                // exactly the case that would have leaked.
+                el.setAttribute('value', REDACTED);
+            }
+        }
+        return `<!DOCTYPE html>\n${clone.outerHTML}`;
+    }, REDACTED).catch(e => `<!-- Error redacting or reading page: ${e.message} -->`);
 }
 
 async function login(credentials = {}) {
@@ -953,10 +1035,7 @@ async function login(credentials = {}) {
             } catch (e) {
                 logger.error(`Failed to enter email: ${e.message}`);
                 if (credentials.dodump) {
-                    const dumpDir = await logger.getDumpDir();
-                    const displayPath = logger.getDumpDisplayPath();
-                    const debugFile = path.join(dumpDir, 'debug_login_error_email.html');
-                    await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                    const displayPath = await dumpPage(page, 'debug_login_error_email.html');
                     logger.error(`Email submission failed. HTML dumped to ${displayPath}/debug_login_error_email.html`);
                 }
                 throw e;
@@ -964,10 +1043,7 @@ async function login(credentials = {}) {
 
             // Proactive dump after email step (before MFA detection)
             if (credentials.dodump) {
-                const dumpDir = await logger.getDumpDir();
-                const displayPath = logger.getDumpDisplayPath();
-                const debugFile = path.join(dumpDir, 'debug_after_email.html');
-                await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                const displayPath = await dumpPage(page, 'debug_after_email.html');
                 logger.debug(`[dodump] Post-email state dumped to ${displayPath}/debug_after_email.html`);
             }
 
@@ -1029,10 +1105,7 @@ async function login(credentials = {}) {
                 }
             } catch (e) {
                 if (credentials.dodump) {
-                    const dumpDir = await logger.getDumpDir();
-                    const displayPath = logger.getDumpDisplayPath();
-                    const debugFile = path.join(dumpDir, 'debug_login_error_password.html');
-                    await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                    const displayPath = await dumpPage(page, 'debug_login_error_password.html');
                     logger.error(`Password entry failed. HTML dumped to ${displayPath}/debug_login_error_password.html`);
                 }
                 throw e;
@@ -1040,10 +1113,7 @@ async function login(credentials = {}) {
 
             // Proactive dump after password submission (before post-password MFA check)
             if (credentials.dodump) {
-                const dumpDir = await logger.getDumpDir();
-                const displayPath = logger.getDumpDisplayPath();
-                const debugFile = path.join(dumpDir, 'debug_after_password.html');
-                await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                const displayPath = await dumpPage(page, 'debug_after_password.html');
                 logger.debug(`[dodump] Post-password state dumped to ${displayPath}/debug_after_password.html`);
             }
 
@@ -1075,10 +1145,7 @@ async function login(credentials = {}) {
                 ]).catch(() => null);
 
                 if (credentials.dodump) {
-                    const dumpDir = await logger.getDumpDir();
-                    const displayPath = logger.getDumpDisplayPath();
-                    const debugFile = path.join(dumpDir, 'debug_post_password_mfa.html');
-                    await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                    const displayPath = await dumpPage(page, 'debug_post_password_mfa.html');
                     logger.debug(`[dodump] Post-password MFA screen state dumped to ${displayPath}/debug_post_password_mfa.html`);
                 }
 
@@ -1166,10 +1233,7 @@ async function login(credentials = {}) {
                     }
                 }
                 if (credentials.dodump) {
-                    const dumpDir = await logger.getDumpDir();
-                    const displayPath = logger.getDumpDisplayPath();
-                    const debugFile = path.join(dumpDir, 'debug_login_error_success.html');
-                    await fs.writeFile(debugFile, await page.content().catch(e => `<!-- Error: ${e.message} -->`));
+                    const displayPath = await dumpPage(page, 'debug_login_error_success.html');
                     logger.error(`Success detection failed. HTML dumped to ${displayPath}/debug_login_error_success.html`);
                 }
                 throw e;
@@ -1278,5 +1342,8 @@ module.exports = {
     reachPasswordScreen,
     // Exported for tests: presses the sign-in submit control on both the legacy
     // (<input type="submit" value="Sign in">) and Fluent (<button>) pages.
-    submitSignInForm
+    submitSignInForm,
+    // Exported for tests: the single path every --dodump write goes through, so
+    // that credentials cannot reach a dump file.
+    dumpPage
 };
