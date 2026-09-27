@@ -56,6 +56,12 @@ describe('generateState', () => {
 });
 
 describe('getEndpoints', () => {
+    test('defaults to the consumers tenant used by the recommended registration', () => {
+        const { authorize, token } = getEndpoints();
+        expect(authorize).toBe('https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize');
+        expect(token).toBe('https://login.microsoftonline.com/consumers/oauth2/v2.0/token');
+    });
+
     test('builds v2.0 endpoints for the common tenant', () => {
         const { authorize, token } = getEndpoints('common');
         expect(authorize).toBe('https://login.microsoftonline.com/common/oauth2/v2.0/authorize');

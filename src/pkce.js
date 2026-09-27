@@ -29,7 +29,11 @@ const { ensureAuthDir } = require('./config');
 
 const DEFAULT_PORT = 8400;
 const DEFAULT_REDIRECT_URI = `http://localhost:${DEFAULT_PORT}/callback`;
-const DEFAULT_TENANT = 'common';
+// Matches the recommended app registration ("Personal Microsoft accounts"),
+// which is single-tenant and therefore consentable without a verified publisher.
+// A multi-tenant app ('common') would require Partner Network verification before
+// end users could grant consent.
+const DEFAULT_TENANT = 'consumers';
 const DEFAULT_SCOPES = 'openid profile email User.Read Notes.Read offline_access';
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 

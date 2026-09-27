@@ -121,7 +121,7 @@ microsoft-webauth login-pkce
 | Option | Description |
 |--------|-------------|
 | `--client-id <id>` | Public client id (or set `MSOUT_CLIENT_ID`) |
-| `--tenant <t>` | `common` (default), `organizations`, `consumers`, or a tenant id |
+| `--tenant <t>` | Must match the app registration. `consumers` for *Personal Microsoft accounts* (default for the setup above); `common` only for multi-tenant apps |
 | `--scopes <list>` | Default: `openid profile email User.Read Notes.Read offline_access` |
 | `--redirect-uri <uri>` | Default: `http://localhost:8400/callback` (must be registered) |
 | `--token-file <path>` | Default: alongside the auth file, `auth-file-token.json` |
@@ -133,7 +133,15 @@ microsoft-webauth login-pkce
 
 1. <https://portal.azure.com> -> **Microsoft Entra ID** -> **App registrations** -> **New registration**
 2. Name: anything, e.g. `webauth-pkce-test`
-3. **Supported account types:** *Accounts in any organizational directory and personal Microsoft accounts* (this is what makes tenant `common` work)
+3. **Supported account types:** *Personal Microsoft accounts*
+   - This is the `consumers` audience, a **single-tenant** app. It is the right choice
+     because end users can grant consent to it without a verified publisher.
+   - Do **not** pick *"Any Entra ID Tenant + Personal Microsoft accounts"* (`common`) for
+     this tool: that is multi-tenant, and Microsoft blocks end-user consent to newly
+     registered multi-tenant apps until the publisher is verified via the Partner
+     Network. Clearing that needs an MPN ID and domain verification.
+   - This registration is only for the personal-account experiment. Professional tenants
+     keep using the Playwright flows above, which need no app registration at all.
 4. **Redirect URI** platform: **Mobile and desktop applications**, value `http://localhost`
    (Microsoft ignores the port for this platform; `8400` is just where this tool listens)
 5. Create, then copy the **Application (client) ID**
