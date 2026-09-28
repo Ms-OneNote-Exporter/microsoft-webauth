@@ -116,6 +116,52 @@ function promptUser(query) {
  * @param {import('playwright').Page} page - Playwright page object
  * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
  */
+/**
+ * The authenticated OneNote web app's path. It is not stable: the Microsoft 365
+ * Copilot rebrand moved it from /notebooks to /copilotnotebooks, and
+ * "/copilotnotebooks".includes("/notebooks") is false — so a substring check on
+ * "/notebooks" alone timed out on a login that had in fact fully succeeded, with
+ * the notebooks UI rendered and the account name on screen, and never saved the
+ * auth state.
+ *
+ * Both spellings are listed, and the "notebooks" component is still required so
+ * the unauthenticated marketing page (onenote.cloud.microsoft/en-us) can never
+ * satisfy this. A bare hostname check would, and did: it caused premature
+ * auth saving.
+ */
+const ONENOTE_APP_PATH = /\/copilotnotebooks\b|\/notebooks\b/;
+
+/** UI markers that only render once the session is actually signed in. */
+const ONENOTE_SIGNED_IN_MARKERS = [
+    'text="My notebooks"',
+    'text="Create new notebook"',
+    'text="All Notebooks"',
+    'text="Welcome, "'
+];
+
+/**
+ * Waits for the authenticated app, bounded by `timeoutMs` instead of the full
+ * production timeout. Returns whether it arrived, so it can be asserted on.
+ * @returns {Promise<boolean>}
+ */
+async function waitForAuthSuccessProbe(page, targetUrl, timeoutMs) {
+    const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
+    const attempts = isOutlook
+        ? [
+            page.waitForSelector('[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList', { state: 'visible', timeout: timeoutMs }),
+            page.waitForSelector('text=/Inbox|Sent Mail|Drafts/i', { state: 'visible', timeout: timeoutMs }),
+            page.waitForSelector('div[role="row"]', { state: 'visible', timeout: timeoutMs }),
+        ]
+        : [
+            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: timeoutMs }),
+            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
+                page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })),
+        ];
+
+    const won = await Promise.any(attempts.map(p => p.then(() => true))).catch(() => false);
+    return won;
+}
+
 async function waitForAuthSuccess(page, targetUrl) {
     const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
 
@@ -131,18 +177,13 @@ async function waitForAuthSuccess(page, targetUrl) {
         ]);
         logger.success('Outlook mail interface detected.');
     } else {
-        // OneNote default behavior — wait for the authenticated notebooks interface.
-        // IMPORTANT: We must require /notebooks in the URL to avoid matching the
-        // unauthenticated marketing landing page (onenote.cloud.microsoft/en-us)
-        // which also matches the old hostname-only check and caused premature auth saving.
         logger.info('Waiting for redirection to authenticated notebooks interface...');
         await Promise.any([
-            // Primary: URL must contain /notebooks (authenticated app)
-            page.waitForURL(url => url.toString().includes('/notebooks'), { timeout: 60000 }),
+            // Primary: the URL must be the authenticated app, not the marketing page
+            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: 60000 }),
             // Fallback UI elements that only appear when actually signed in
-            page.waitForSelector('text="My notebooks"', { state: 'visible', timeout: 60000 }),
-            page.waitForSelector('text="Create new notebook"', { state: 'visible', timeout: 60000 }),
-            page.waitForSelector('text="Welcome, "', { state: 'visible', timeout: 60000 }),
+            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
+                page.waitForSelector(marker, { state: 'visible', timeout: 60000 })),
         ]);
         logger.success('Authenticated notebooks interface detected.');
     }
@@ -576,6 +617,14 @@ async function readSignInState(page) {
         return await page.evaluate(labels => {
             const visible = el => {
                 if (!el) return false;
+                // aria-hidden means the element is not exposed to the user, so it
+                // is not something the user can interact with. login.microsoftonline.com
+                // parks its leftover fields in the DOM exactly this way:
+                // <input name="loginfmt" class="moveOffScreen" aria-hidden="true">.
+                // Those are off-screen rather than display:none, so they still have
+                // a non-zero box and pass a pure geometry test — which is how a
+                // work account's password page was mistaken for the email step.
+                if (el.getAttribute('aria-hidden') === 'true') return false;
                 const rect = el.getBoundingClientRect();
                 if (rect.width <= 0 || rect.height <= 0) return false;
                 const style = window.getComputedStyle(el);
@@ -780,13 +829,21 @@ async function reachPasswordScreen(page, options = {}) {
     let dumped = false;
 
     for (let steps = 0; steps < maxSteps; steps++) {
-        if (!state || !isActionableSignInState(state)) {
-            return { reached: false, reason: 'unreadable', steps, state };
-        }
-
-        if (state.passwordField) {
+        // The password box is checked FIRST, ahead of the "still on the email
+        // step" gate below. A work/school account signs in on
+        // login.microsoftonline.com, whose password page keeps the username
+        // field in the DOM as <input name="loginfmt" class="moveOffScreen"> —
+        // rendered off-screen, and therefore "visible" by any geometry test.
+        // Gating on emailField first made every such login report "unreadable"
+        // and burn the whole stateTimeout while the password box sat right
+        // there, ready to be filled.
+        if (state && state.passwordField) {
             logger.debug(`Password field reached after ${steps} step(s).`);
             return { reached: true, reason: 'password_field', steps, state };
+        }
+
+        if (!state || !isActionableSignInState(state)) {
+            return { reached: false, reason: 'unreadable', steps, state };
         }
 
         if (dodump && !dumped) {
@@ -1019,9 +1076,17 @@ async function login(credentials = {}) {
                 logger.info('Email entered. Clicking "Next"...');
                 await page.click('input[type="submit"]');
 
-                logger.debug('Waiting for email field to disappear...');
-                await page.waitForSelector('input[name="loginfmt"]', { state: 'hidden', timeout: 15000 }).catch(() => {
-                    logger.debug('Email field still present, proceeding with caution.');
+                // Wait for the email form to actually be replaced, but not for the
+                // loginfmt input to vanish: on login.microsoftonline.com it is
+                // parked as <input name="loginfmt" class="moveOffScreen"> and stays
+                // in the DOM for the rest of the login, so "hidden" never happens
+                // and this used to burn the full timeout on every work account.
+                // The next step appearing is the real signal that we have moved on.
+                await Promise.race([
+                    page.waitForSelector(PASSWORD_FIELD_SELECTOR, { state: 'visible', timeout: 15000 }).then(() => 'password'),
+                    page.waitForSelector('input[name="loginfmt"]', { state: 'hidden', timeout: 15000 }).then(() => 'advanced'),
+                ]).catch(() => {
+                    logger.debug('Email form did not visibly change yet; the sign-in method step will wait for the next screen.');
                 });
 
                 logger.info('Will wait 1 seconds to give the UI a moment to settle into the next screen (MFA/Password)');
@@ -1345,5 +1410,9 @@ module.exports = {
     submitSignInForm,
     // Exported for tests: the single path every --dodump write goes through, so
     // that credentials cannot reach a dump file.
-    dumpPage
+    dumpPage,
+    // Exported for tests: the same success detection with a caller-supplied
+    // timeout, so "is this the authenticated app?" can be asserted on directly
+    // rather than through a 60 s wait.
+    waitForAuthSuccessProbe
 };
