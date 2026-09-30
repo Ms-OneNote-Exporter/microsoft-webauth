@@ -825,7 +825,19 @@ async function reachPasswordScreen(page, options = {}) {
         dumpFile = 'debug_intermediate_screen'
     } = options;
 
-    let state = await waitForSignInState(page, stateTimeout);
+    // The password box has to be accepted by this *initial* wait, not only by
+    // the loop below. isActionableSignInState is false whenever emailField is
+    // set, so on a layout that keeps a real username field on screen next to the
+    // password box — "Use a different account" and friends — this wait could
+    // never be satisfied and always ran to its full stateTimeout, no matter how
+    // long it was given. The password box then got noticed by the loop
+    // afterwards, so the login still worked: it just took 15 s to start.
+    //
+    // Same shape as the post-click wait at the bottom of the loop. On the
+    // ordinary email step both terms are false, so the behaviour there is
+    // unchanged: still waits out the timeout and reports "unreadable".
+    let state = await waitForSignInState(page, stateTimeout,
+        s => s.passwordField || isActionableSignInState(s));
     let dumped = false;
 
     for (let steps = 0; steps < maxSteps; steps++) {
