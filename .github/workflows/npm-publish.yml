@@ -33,8 +33,23 @@ jobs:
           echo "Publishing ${PKG_VERSION} from tag ${GITHUB_REF_NAME}"
 
       - run: npm ci
+
+      # `npm ci` does not fetch a browser: the playwright package has no
+      # postinstall script. Without this step the four browser-backed suites
+      # skip themselves and `npm test` exits 0 having run 10 of 38 tests — so
+      # the publish below would be gated on a suite that never once touched the
+      # login flow, which is the only thing this package does. Measured, not
+      # hypothetical: see the test suite's chromium guard.
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
       - run: npm run build --if-present
       - run: npm test
+        env:
+          # Belt and braces: if the install step above ever breaks, a skip must
+          # still fail the release. Takes effect once the suite-side guard lands
+          # in #19; inert until then, harmless in the meantime.
+          PW_TESTS_REQUIRE_BROWSER: '1'
 
       # Never let a stray auth state file ride along in the tarball: these hold
       # live session cookies and MSAL tokens. A release must not depend on

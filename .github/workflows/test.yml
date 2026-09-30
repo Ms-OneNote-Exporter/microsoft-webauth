@@ -1,0 +1,46 @@
+name: Tests
+
+# The publish workflow already runs `npm test`, but only on a v* tag — the worst
+# possible moment to discover a regression, because the failing commit is already
+# on npm. This runs the same suite on every pull request, so a branch is gated
+# before review rather than after release.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          # Same rationale as npm-publish.yml: no caching. A cached browser or
+          # node_modules tree is a stale-artifact source, and this suite is fast
+          # enough that the cache saves less than it can cost.
+          package-manager-cache: false
+
+      - run: npm ci
+
+      # `npm ci` does not fetch a browser — the playwright package has no
+      # postinstall script. This step is load-bearing, not a convenience: without
+      # it the browser-backed suites skip themselves and the run goes green
+      # having executed none of the auth regressions. Confirmed on the first run
+      # of this workflow, which downloaded 114.2 MiB that `npm ci` had not.
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - run: npm test
+        env:
+          # A missing browser must fail here rather than skip. The install step
+          # above makes a skip impossible, so a skip in CI can only mean that
+          # step broke. Locally the suites still skip, so a checkout without
+          # `npx playwright install chromium` stays usable.
+          PW_TESTS_REQUIRE_BROWSER: '1'
