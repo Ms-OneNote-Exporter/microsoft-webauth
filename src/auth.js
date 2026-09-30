@@ -112,11 +112,6 @@ function promptUser(query) {
 }
 
 /**
- * Waits for successful authentication based on target URL.
- * @param {import('playwright').Page} page - Playwright page object
- * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
- */
-/**
  * The authenticated OneNote web app's path. It is not stable: the Microsoft 365
  * Copilot rebrand moved it from /notebooks to /copilotnotebooks, and
  * "/copilotnotebooks".includes("/notebooks") is false — so a substring check on
@@ -153,54 +148,82 @@ const ONENOTE_SIGNED_IN_MARKERS = [
     'text="Welcome, "'
 ];
 
+/** The same idea for Outlook, which lands in a mailbox rather than a notebook list. */
+const OUTLOOK_SIGNED_IN_MARKERS = [
+    // Outlook: wait for email message list (table with emails)
+    '[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList',
+    // Fallback: wait for folder navigation (Inbox, Sent, etc.)
+    'text=/Inbox|Sent Mail|Drafts/i',
+    // Fallback: wait for any email-like content
+    'div[role="row"]'
+];
+
+/** How long success detection waits before giving up. */
+const AUTH_SUCCESS_TIMEOUT = 60000;
+
+/** Outlook and OneNote are recognised differently, so the target picks the set. */
+const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.cloud.microsoft');
+
+/**
+ * Every signal that the session reached the authenticated app, as pending waits.
+ *
+ * One definition, used by both the production wait and the test probe, so a
+ * selector changed here cannot pass the suite while production still waits on
+ * the old one. They previously kept separate copies of this list; the OneNote
+ * half was already shared, the Outlook half was a verbatim copy-paste.
+ *
+ * Note these are *waits*, not a race with a timer: the first to resolve wins
+ * and the rest are left to settle on their own.
+ *
+ * @returns {Promise<unknown>[]}
+ */
+function authSuccessAttempts(page, targetUrl, timeoutMs) {
+    const selectorWaits = markers => markers.map(marker =>
+        page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs }));
+
+    if (isOutlookTarget(targetUrl)) return selectorWaits(OUTLOOK_SIGNED_IN_MARKERS);
+
+    return [
+        // Primary: the URL must be the authenticated app, not the marketing page
+        page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs }),
+        // Fallback UI elements that only appear when actually signed in
+        ...selectorWaits(ONENOTE_SIGNED_IN_MARKERS)
+    ];
+}
+
 /**
  * Waits for the authenticated app, bounded by `timeoutMs` instead of the full
  * production timeout. Returns whether it arrived, so it can be asserted on.
  * @returns {Promise<boolean>}
  */
 async function waitForAuthSuccessProbe(page, targetUrl, timeoutMs) {
-    const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
-    const attempts = isOutlook
-        ? [
-            page.waitForSelector('[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList', { state: 'visible', timeout: timeoutMs }),
-            page.waitForSelector('text=/Inbox|Sent Mail|Drafts/i', { state: 'visible', timeout: timeoutMs }),
-            page.waitForSelector('div[role="row"]', { state: 'visible', timeout: timeoutMs }),
-        ]
-        : [
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs }),
-            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
-                page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })),
-        ];
-
-    const won = await Promise.any(attempts.map(p => p.then(() => true))).catch(() => false);
+    const won = await Promise.any(
+        authSuccessAttempts(page, targetUrl, timeoutMs).map(p => p.then(() => true))
+    ).catch(() => false);
     return won;
 }
 
+/**
+ * Waits for successful authentication based on target URL.
+ * @param {import('playwright').Page} page - Playwright page object
+ * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
+ */
 async function waitForAuthSuccess(page, targetUrl) {
-    const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
+    const isOutlook = isOutlookTarget(targetUrl);
 
-    if (isOutlook) {
-        logger.info('Waiting for redirection to Outlook mail...');
-        await Promise.any([
-            // Outlook: wait for email message list (table with emails)
-            page.waitForSelector('[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList', { state: 'visible', timeout: 60000 }),
-            // Fallback: wait for folder navigation (Inbox, Sent, etc.)
-            page.waitForSelector('text=/Inbox|Sent Mail|Drafts/i', { state: 'visible', timeout: 60000 }),
-            // Fallback: wait for any email-like content
-            page.waitForSelector('div[role="row"]', { state: 'visible', timeout: 60000 }),
-        ]);
-        logger.success('Outlook mail interface detected.');
-    } else {
-        logger.info('Waiting for redirection to authenticated notebooks interface...');
-        await Promise.any([
-            // Primary: the URL must be the authenticated app, not the marketing page
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: 60000 }),
-            // Fallback UI elements that only appear when actually signed in
-            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
-                page.waitForSelector(marker, { state: 'visible', timeout: 60000 })),
-        ]);
-        logger.success('Authenticated notebooks interface detected.');
-    }
+    logger.info(isOutlook
+        ? 'Waiting for redirection to Outlook mail...'
+        : 'Waiting for redirection to authenticated notebooks interface...');
+
+    // Resolves on the first signal, rejects if every one of them times out —
+    // which the caller turns into the "still on X" timeout report. The probe
+    // above resolves that rejection to a boolean instead, because a test wants
+    // an answer rather than an exception.
+    await Promise.any(authSuccessAttempts(page, targetUrl, AUTH_SUCCESS_TIMEOUT));
+
+    logger.success(isOutlook
+        ? 'Outlook mail interface detected.'
+        : 'Authenticated notebooks interface detected.');
 }
 
 /**
