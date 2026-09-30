@@ -165,29 +165,42 @@ const AUTH_SUCCESS_TIMEOUT = 60000;
 const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.cloud.microsoft');
 
 /**
- * Every signal that the session reached the authenticated app, as pending waits.
+ * Every signal that the session reached the authenticated app, each paired with
+ * a label naming it.
  *
  * One definition, used by both the production wait and the test probe, so a
  * selector changed here cannot pass the suite while production still waits on
  * the old one. They previously kept separate copies of this list; the OneNote
  * half was already shared, the Outlook half was a verbatim copy-paste.
  *
+ * The labels earn their keep on the failure path. This repo has been bitten
+ * twice by a success signal going stale without anyone noticing — the /notebooks
+ * path moving to /copilotnotebooks, and a marker no longer rendered — and in
+ * both cases the only symptom was a bare timeout. When every signal has missed,
+ * the error can now say which ones were being watched, so the next one is
+ * diagnosable from the report alone.
+ *
  * Note these are *waits*, not a race with a timer: the first to resolve wins
  * and the rest are left to settle on their own.
  *
- * @returns {Promise<unknown>[]}
+ * @returns {{label: string, wait: Promise<unknown>}[]}
  */
 function authSuccessAttempts(page, targetUrl, timeoutMs) {
-    const selectorWaits = markers => markers.map(marker =>
-        page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs }));
+    const markerWaits = (markers, kind) => markers.map(marker => ({
+        label: `${kind} "${marker}"`,
+        wait: page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })
+    }));
 
-    if (isOutlookTarget(targetUrl)) return selectorWaits(OUTLOOK_SIGNED_IN_MARKERS);
+    if (isOutlookTarget(targetUrl)) return markerWaits(OUTLOOK_SIGNED_IN_MARKERS, 'Outlook marker');
 
     return [
-        // Primary: the URL must be the authenticated app, not the marketing page
-        page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs }),
+        {
+            label: `OneNote app path ${ONENOTE_APP_PATH}`,
+            // Primary: the URL must be the authenticated app, not the marketing page
+            wait: page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs })
+        },
         // Fallback UI elements that only appear when actually signed in
-        ...selectorWaits(ONENOTE_SIGNED_IN_MARKERS)
+        ...markerWaits(ONENOTE_SIGNED_IN_MARKERS, 'OneNote marker')
     ];
 }
 
@@ -198,28 +211,44 @@ function authSuccessAttempts(page, targetUrl, timeoutMs) {
  */
 async function waitForAuthSuccessProbe(page, targetUrl, timeoutMs) {
     const won = await Promise.any(
-        authSuccessAttempts(page, targetUrl, timeoutMs).map(p => p.then(() => true))
+        authSuccessAttempts(page, targetUrl, timeoutMs).map(a => a.wait.then(() => true))
     ).catch(() => false);
     return won;
 }
 
 /**
  * Waits for successful authentication based on target URL.
+ *
+ * Rejects with a message naming what was being waited for and which signals were
+ * being watched. `Promise.any` would otherwise reject with an AggregateError of
+ * bare TimeoutErrors, which surfaces to the user as "All promises were
+ * rejected" and names nothing at all.
+ *
  * @param {import('playwright').Page} page - Playwright page object
  * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
+ * @param {number} [timeoutMs] override for the wait; tests use a short one
  */
-async function waitForAuthSuccess(page, targetUrl) {
+async function waitForAuthSuccess(page, targetUrl, timeoutMs = AUTH_SUCCESS_TIMEOUT) {
     const isOutlook = isOutlookTarget(targetUrl);
 
     logger.info(isOutlook
         ? 'Waiting for redirection to Outlook mail...'
         : 'Waiting for redirection to authenticated notebooks interface...');
 
-    // Resolves on the first signal, rejects if every one of them times out —
-    // which the caller turns into the "still on X" timeout report. The probe
-    // above resolves that rejection to a boolean instead, because a test wants
-    // an answer rather than an exception.
-    await Promise.any(authSuccessAttempts(page, targetUrl, AUTH_SUCCESS_TIMEOUT));
+    const attempts = authSuccessAttempts(page, targetUrl, timeoutMs);
+
+    try {
+        await Promise.any(attempts.map(a => a.wait));
+    } catch (e) {
+        // The caller catches this and adds where the browser actually ended up,
+        // so this half only has to say what was being waited for and which
+        // signals never arrived.
+        throw new Error(
+            `Timed out after ${timeoutMs / 1000}s waiting for ${isOutlook ? 'Outlook mail' : 'the authenticated OneNote app'}. `
+            + `None of the ${attempts.length} success signals appeared: `
+            + attempts.map(a => a.label).join('; ')
+        );
+    }
 
     logger.success(isOutlook
         ? 'Outlook mail interface detected.'
@@ -1463,5 +1492,9 @@ module.exports = {
     // Exported for tests: the same success detection with a caller-supplied
     // timeout, so "is this the authenticated app?" can be asserted on directly
     // rather than through a 60 s wait.
-    waitForAuthSuccessProbe
+    waitForAuthSuccessProbe,
+    // Exported for tests: the production wait itself, with a caller-supplied
+    // timeout, so the failure report can be asserted on. The probe above only
+    // says whether it arrived; this is what a user actually sees when it did not.
+    waitForAuthSuccess
 };

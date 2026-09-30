@@ -12,7 +12,7 @@ jest.mock('../src/utils/logger', () => ({
     getDumpDisplayPath: () => 'logs/dumps/test'
 }));
 
-const { reachPasswordScreen, waitForAuthSuccessProbe } = require('../src/auth');
+const { reachPasswordScreen, waitForAuthSuccessProbe, waitForAuthSuccess } = require('../src/auth');
 
 /**
  * These tests replay a *work/school* account sign-in, using markup taken from the
@@ -267,5 +267,40 @@ describeWithBrowser('work/school account sign-in', () => {
 
         await expect(waitForAuthSuccessProbe(page, 'https://onenote.cloud.microsoft/notebooks', 2000))
             .resolves.toBe(false);
+    }, 30000);
+
+    // The next two cover what a user is actually shown when none of the signals
+    // arrives. Promise.any rejects with an AggregateError of bare TimeoutErrors,
+    // which prints as "All promises were rejected" and names nothing — the
+    // opposite of useful when the cause is a stale marker or a moved path, which
+    // is what this file's two regressions were.
+    it('names the signals it waited for when the authenticated app never arrives', async () => {
+        await page.goto('https://onenote.cloud.microsoft/en-us');
+
+        // The caller adds where the browser ended up; this half has to say what
+        // was expected and what was being watched.
+        const err = await waitForAuthSuccess(page, 'https://onenote.cloud.microsoft/notebooks', 2000)
+            .then(() => null, e => e);
+
+        expect(err).toBeInstanceOf(Error);
+        expect(err).not.toBeInstanceOf(AggregateError);
+        expect(err.message).toMatch(/Timed out after 2s waiting for the authenticated OneNote app/);
+        // Every signal, by name, so a renamed marker is diagnosable from this.
+        expect(err.message).toContain('OneNote app path');
+        expect(err.message).toContain('text="My notebooks"');
+        expect(err.message).toContain('text="All Notebooks"');
+    }, 30000);
+
+    it('reports the Outlook signals when an Outlook login does not land', async () => {
+        await page.goto('https://onenote.cloud.microsoft/en-us');
+
+        const err = await waitForAuthSuccess(page, 'https://outlook.cloud.microsoft/mail/', 2000)
+            .then(() => null, e => e);
+
+        expect(err).toBeInstanceOf(Error);
+        expect(err.message).toMatch(/Timed out after 2s waiting for Outlook mail/);
+        // The OneNote markers must not leak into the Outlook report.
+        expect(err.message).toContain('Outlook marker');
+        expect(err.message).not.toContain('My notebooks');
     }, 30000);
 });
