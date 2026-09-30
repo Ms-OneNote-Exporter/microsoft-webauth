@@ -127,7 +127,37 @@ microsoft-webauth logout --auth-file /path/to/authfile.json
 | `--password <password>` | Microsoft account password (for automated login) |
 | `--notheadless` | Run in visible browser mode (disable headless) |
 | `--dodump` | Dump HTML content to files for debugging |
+| `--screenshot` | With `--dodump`, also save a PNG screenshot of each dumped page |
 | `--auth-file <path>` | Path to auth file (default: ~/.microsoft-webauth/auth-file.json) |
+
+## Debug dumps and screenshots
+
+```bash
+microsoft-webauth login --email you@example.com --password ... --dodump --screenshot
+```
+
+With `--dodump`, every screen state captured during an automated login is
+written to `src/logs/dumps/<YYYY-MM-DD_HHhMM>/` as HTML — after the email step,
+after the password, on each interstitial screen, and on the failure paths.
+Adding `--screenshot` saves a full-page PNG of the same screen under the same
+basename, so `debug_after_email.html` is accompanied by
+`debug_after_email.png`.
+
+The HTML says *which* screen this was; the screenshot says what it *looked* like,
+which is what answers the questions a dump usually gets asked — was something
+covering the button, was there a banner or an overlay, did the page render at all.
+A capture that cannot be taken (the page navigated away mid-capture) is reported
+as a warning and never fails the login.
+
+Two things to know before sharing a dump directory:
+
+- HTML dumps have credential fields redacted; screenshots cannot be, being
+  bitmaps. That costs nothing in credential terms — a password field renders as
+  dots — but a screenshot does show the number-match MFA code, exactly as the
+  HTML dump and the terminal log already do.
+- Both land in the same gitignored directory. Treat them as you would the dumps:
+  worth attaching to a bug report, not worth pasting into a public channel
+  unedited.
 
 ## Output
 
