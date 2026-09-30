@@ -143,7 +143,11 @@ describeWithBrowser('work/school account sign-in', () => {
         await context.close();
     });
 
-    const options = extra => ({ stateTimeout: 3000, transitionTimeout: 3000, ...extra });
+    // Long enough that a suite which stalls is obvious, short enough that a
+    // regression which burns the whole budget is still visible in the numbers.
+    const STATE_TIMEOUT = 3000;
+
+    const options = extra => ({ stateTimeout: STATE_TIMEOUT, transitionTimeout: 3000, ...extra });
 
     it('recognises the password box even though the email field lingers', async () => {
         await page.goto(PASSWORD_URL);
@@ -164,7 +168,9 @@ describeWithBrowser('work/school account sign-in', () => {
         await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: visibleUsernamePage }));
         await page.goto(`${PASSWORD_URL}&visible=1`);
 
+        const t0 = Date.now();
         const result = await reachPasswordScreen(page, options());
+        const elapsed = Date.now() - t0;
 
         // Here emailField really is true, so only the ordering of the two checks
         // can save this: the password box is proof the email step is done,
@@ -172,6 +178,15 @@ describeWithBrowser('work/school account sign-in', () => {
         expect(result.state.emailField).toBe(true);
         expect(result.reached).toBe(true);
         expect(result.reason).toBe('password_field');
+
+        // The box is already on screen when we arrive, so this needs to wait for
+        // nothing at all. It used to take the full stateTimeout: the initial read
+        // accepted only isActionableSignInState, which is false whenever
+        // emailField is set, so that wait could never be satisfied no matter how
+        // long it ran — the password box was only noticed by the loop afterwards.
+        // Half the budget is a wide margin: the stalled case lands above it at
+        // ~3300 ms, the working case an order of magnitude below.
+        expect(elapsed).toBeLessThan(STATE_TIMEOUT / 2);
     }, 30000);
 
     it('accepts the rebrand path /copilotnotebooks as authenticated', async () => {
