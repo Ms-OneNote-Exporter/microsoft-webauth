@@ -112,11 +112,6 @@ function promptUser(query) {
 }
 
 /**
- * Waits for successful authentication based on target URL.
- * @param {import('playwright').Page} page - Playwright page object
- * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
- */
-/**
  * The authenticated OneNote web app's path. It is not stable: the Microsoft 365
  * Copilot rebrand moved it from /notebooks to /copilotnotebooks, and
  * "/copilotnotebooks".includes("/notebooks") is false — so a substring check on
@@ -128,6 +123,20 @@ function promptUser(query) {
  * the unauthenticated marketing page (onenote.cloud.microsoft/en-us) can never
  * satisfy this. A bare hostname check would, and did: it caused premature
  * auth saving.
+ *
+ * This is matched against `url.pathname` and never against the serialised URL.
+ * A substring match on the whole string accepts a notebooks path that is not a
+ * path at all — a `?next=/copilotnotebooks` on the marketing page, or a
+ * `?returnUrl=/notebooks` on a login screen — which is the same class of false
+ * positive as the bare-hostname check, one level removed. It decides when live
+ * auth state gets written to disk, so the check is worth making an actual
+ * invariant about the path.
+ *
+ * Deliberately not constrained to a host allowlist: OneNote notebooks are
+ * SharePoint-backed, and a tenant served from another host would be a real
+ * successful login reported as a failure. Requiring the *path* is enough to
+ * separate the app from the marketing page, and it cannot go stale the way a
+ * host list would.
  */
 const ONENOTE_APP_PATH = /\/copilotnotebooks\b|\/notebooks\b/;
 
@@ -139,54 +148,111 @@ const ONENOTE_SIGNED_IN_MARKERS = [
     'text="Welcome, "'
 ];
 
+/** The same idea for Outlook, which lands in a mailbox rather than a notebook list. */
+const OUTLOOK_SIGNED_IN_MARKERS = [
+    // Outlook: wait for email message list (table with emails)
+    '[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList',
+    // Fallback: wait for folder navigation (Inbox, Sent, etc.)
+    'text=/Inbox|Sent Mail|Drafts/i',
+    // Fallback: wait for any email-like content
+    'div[role="row"]'
+];
+
+/** How long success detection waits before giving up. */
+const AUTH_SUCCESS_TIMEOUT = 60000;
+
+/** Outlook and OneNote are recognised differently, so the target picks the set. */
+const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.cloud.microsoft');
+
+/**
+ * Every signal that the session reached the authenticated app, each paired with
+ * a label naming it.
+ *
+ * One definition, used by both the production wait and the test probe, so a
+ * selector changed here cannot pass the suite while production still waits on
+ * the old one. They previously kept separate copies of this list; the OneNote
+ * half was already shared, the Outlook half was a verbatim copy-paste.
+ *
+ * The labels earn their keep on the failure path. This repo has been bitten
+ * twice by a success signal going stale without anyone noticing — the /notebooks
+ * path moving to /copilotnotebooks, and a marker no longer rendered — and in
+ * both cases the only symptom was a bare timeout. When every signal has missed,
+ * the error can now say which ones were being watched, so the next one is
+ * diagnosable from the report alone.
+ *
+ * Note these are *waits*, not a race with a timer: the first to resolve wins
+ * and the rest are left to settle on their own.
+ *
+ * @returns {{label: string, wait: Promise<unknown>}[]}
+ */
+function authSuccessAttempts(page, targetUrl, timeoutMs) {
+    const markerWaits = (markers, kind) => markers.map(marker => ({
+        label: `${kind} "${marker}"`,
+        wait: page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })
+    }));
+
+    if (isOutlookTarget(targetUrl)) return markerWaits(OUTLOOK_SIGNED_IN_MARKERS, 'Outlook marker');
+
+    return [
+        {
+            label: `OneNote app path ${ONENOTE_APP_PATH}`,
+            // Primary: the URL must be the authenticated app, not the marketing page
+            wait: page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs })
+        },
+        // Fallback UI elements that only appear when actually signed in
+        ...markerWaits(ONENOTE_SIGNED_IN_MARKERS, 'OneNote marker')
+    ];
+}
+
 /**
  * Waits for the authenticated app, bounded by `timeoutMs` instead of the full
  * production timeout. Returns whether it arrived, so it can be asserted on.
  * @returns {Promise<boolean>}
  */
 async function waitForAuthSuccessProbe(page, targetUrl, timeoutMs) {
-    const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
-    const attempts = isOutlook
-        ? [
-            page.waitForSelector('[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList', { state: 'visible', timeout: timeoutMs }),
-            page.waitForSelector('text=/Inbox|Sent Mail|Drafts/i', { state: 'visible', timeout: timeoutMs }),
-            page.waitForSelector('div[role="row"]', { state: 'visible', timeout: timeoutMs }),
-        ]
-        : [
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: timeoutMs }),
-            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
-                page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })),
-        ];
-
-    const won = await Promise.any(attempts.map(p => p.then(() => true))).catch(() => false);
+    const won = await Promise.any(
+        authSuccessAttempts(page, targetUrl, timeoutMs).map(a => a.wait.then(() => true))
+    ).catch(() => false);
     return won;
 }
 
-async function waitForAuthSuccess(page, targetUrl) {
-    const isOutlook = targetUrl && targetUrl.includes('outlook.cloud.microsoft');
+/**
+ * Waits for successful authentication based on target URL.
+ *
+ * Rejects with a message naming what was being waited for and which signals were
+ * being watched. `Promise.any` would otherwise reject with an AggregateError of
+ * bare TimeoutErrors, which surfaces to the user as "All promises were
+ * rejected" and names nothing at all.
+ *
+ * @param {import('playwright').Page} page - Playwright page object
+ * @param {string} targetUrl - The target URL (ONENOTE_URL or OUTLOOK_URL)
+ * @param {number} [timeoutMs] override for the wait; tests use a short one
+ */
+async function waitForAuthSuccess(page, targetUrl, timeoutMs = AUTH_SUCCESS_TIMEOUT) {
+    const isOutlook = isOutlookTarget(targetUrl);
 
-    if (isOutlook) {
-        logger.info('Waiting for redirection to Outlook mail...');
-        await Promise.any([
-            // Outlook: wait for email message list (table with emails)
-            page.waitForSelector('[aria-label*="message list"], [role="grid"][aria-label*="mail"], .messageList', { state: 'visible', timeout: 60000 }),
-            // Fallback: wait for folder navigation (Inbox, Sent, etc.)
-            page.waitForSelector('text=/Inbox|Sent Mail|Drafts/i', { state: 'visible', timeout: 60000 }),
-            // Fallback: wait for any email-like content
-            page.waitForSelector('div[role="row"]', { state: 'visible', timeout: 60000 }),
-        ]);
-        logger.success('Outlook mail interface detected.');
-    } else {
-        logger.info('Waiting for redirection to authenticated notebooks interface...');
-        await Promise.any([
-            // Primary: the URL must be the authenticated app, not the marketing page
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: 60000 }),
-            // Fallback UI elements that only appear when actually signed in
-            ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
-                page.waitForSelector(marker, { state: 'visible', timeout: 60000 })),
-        ]);
-        logger.success('Authenticated notebooks interface detected.');
+    logger.info(isOutlook
+        ? 'Waiting for redirection to Outlook mail...'
+        : 'Waiting for redirection to authenticated notebooks interface...');
+
+    const attempts = authSuccessAttempts(page, targetUrl, timeoutMs);
+
+    try {
+        await Promise.any(attempts.map(a => a.wait));
+    } catch (e) {
+        // The caller catches this and adds where the browser actually ended up,
+        // so this half only has to say what was being waited for and which
+        // signals never arrived.
+        throw new Error(
+            `Timed out after ${timeoutMs / 1000}s waiting for ${isOutlook ? 'Outlook mail' : 'the authenticated OneNote app'}. `
+            + `None of the ${attempts.length} success signals appeared: `
+            + attempts.map(a => a.label).join('; ')
+        );
     }
+
+    logger.success(isOutlook
+        ? 'Outlook mail interface detected.'
+        : 'Authenticated notebooks interface detected.');
 }
 
 /**
@@ -825,7 +891,19 @@ async function reachPasswordScreen(page, options = {}) {
         dumpFile = 'debug_intermediate_screen'
     } = options;
 
-    let state = await waitForSignInState(page, stateTimeout);
+    // The password box has to be accepted by this *initial* wait, not only by
+    // the loop below. isActionableSignInState is false whenever emailField is
+    // set, so on a layout that keeps a real username field on screen next to the
+    // password box — "Use a different account" and friends — this wait could
+    // never be satisfied and always ran to its full stateTimeout, no matter how
+    // long it was given. The password box then got noticed by the loop
+    // afterwards, so the login still worked: it just took 15 s to start.
+    //
+    // Same shape as the post-click wait at the bottom of the loop. On the
+    // ordinary email step both terms are false, so the behaviour there is
+    // unchanged: still waits out the timeout and reports "unreadable".
+    let state = await waitForSignInState(page, stateTimeout,
+        s => s.passwordField || isActionableSignInState(s));
     let dumped = false;
 
     for (let steps = 0; steps < maxSteps; steps++) {
@@ -1414,5 +1492,9 @@ module.exports = {
     // Exported for tests: the same success detection with a caller-supplied
     // timeout, so "is this the authenticated app?" can be asserted on directly
     // rather than through a 60 s wait.
-    waitForAuthSuccessProbe
+    waitForAuthSuccessProbe,
+    // Exported for tests: the production wait itself, with a caller-supplied
+    // timeout, so the failure report can be asserted on. The probe above only
+    // says whether it arrived; this is what a user actually sees when it did not.
+    waitForAuthSuccess
 };
