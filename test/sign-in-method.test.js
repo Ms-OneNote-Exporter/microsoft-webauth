@@ -1,5 +1,4 @@
-const fs = require('fs');
-const { chromium } = require('playwright');
+const { chromium, describeWithBrowser } = require('./helpers/browser-suite');
 
 jest.mock('../src/utils/logger', () => ({
     info: jest.fn(),
@@ -14,25 +13,6 @@ jest.mock('../src/utils/logger', () => ({
 
 const { reachPasswordScreen, submitSignInForm } = require('../src/auth');
 
-/**
- * These tests replay the screen that broke the login, using the markup captured
- * from the live page (see the debug_intermediate_screen.html dumps under
- * src/logs/dumps, login.live.com PageID i5030). They are stubbed over page.route
- * so nothing touches the network and the suite is deterministic.
- */
-const describeWithBrowser = (() => {
-    let executable = null;
-    try {
-        executable = chromium.executablePath();
-    } catch (_) {
-        // playwright could not resolve a path at all
-    }
-    if (!executable || !fs.existsSync(executable)) {
-        console.warn('Skipping sign-in method tests: chromium is not installed. Run `npx playwright install chromium`.');
-        return describe.skip;
-    }
-    return describe;
-})();
 
 const CODE_URL = 'https://login.live.com/ppsecure/post.srf?id=100';
 const METHODS_URL = 'https://login.live.com/ppsecure/post.srf?id=200';
