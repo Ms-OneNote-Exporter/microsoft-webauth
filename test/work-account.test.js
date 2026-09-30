@@ -199,6 +199,24 @@ describeWithBrowser('work/school account sign-in', () => {
             .resolves.toBe(true);
     }, 30000);
 
+    it('accepts the old /notebooks URL on its own, before the SPA has rendered', async () => {
+        await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: bareCopilotShell }));
+        await page.goto('https://onenote.cloud.microsoft/notebooks');
+
+        // The twin of the rebrand case above, and the one that was missing. The
+        // rendered-app test just above passes on the "All Notebooks" text
+        // marker, so deleting the /notebooks branch from the URL check left the
+        // whole suite green — dc04e9f found and closed that gap for the rebrand
+        // path and not for this one. Confirmed by removing the branch: only
+        // this test fails.
+        //
+        // No signed-in text here, so the URL is the only thing that can satisfy
+        // the probe, and this is what makes both branches of ONENOTE_APP_PATH
+        // load-bearing.
+        await expect(waitForAuthSuccessProbe(page, 'https://onenote.cloud.microsoft/notebooks', 5000))
+            .resolves.toBe(true);
+    }, 30000);
+
     it('never accepts the unauthenticated marketing page', async () => {
         await page.goto('https://onenote.cloud.microsoft/en-us');
 
