@@ -14,3 +14,8 @@ auth-meta.json
 .qwen/
 .github/
 jest.config.js
+
+# Review record for the work-account fix. Useful in the repository, noise in
+# the tarball — it is 19 kB of internal notes about how the auth code got here,
+# which is not something a consumer of the package needs to download.
+REVIEW-CODE.md
