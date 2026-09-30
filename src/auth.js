@@ -690,7 +690,10 @@ async function readSignInState(page) {
                 // Those are off-screen rather than display:none, so they still have
                 // a non-zero box and pass a pure geometry test — which is how a
                 // work account's password page was mistaken for the email step.
-                if (el.getAttribute('aria-hidden') === 'true') return false;
+                // Compared case-insensitively because ARIA token values are
+                // defined as ASCII case-insensitive, so "True" means the same
+                // thing and must not read as visible.
+                if ((el.getAttribute('aria-hidden') || '').trim().toLowerCase() === 'true') return false;
                 const rect = el.getBoundingClientRect();
                 if (rect.width <= 0 || rect.height <= 0) return false;
                 const style = window.getComputedStyle(el);

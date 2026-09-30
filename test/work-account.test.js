@@ -82,6 +82,22 @@ const visibleUsernamePage = PAGE$('Sign in to your account', `
 // rather than leaning on a text marker that may not have rendered.
 const bareCopilotShell = PAGE$('OneNote', '<div id="root"></div>');
 
+// The same page, but with the parked field marked aria-hidden="True". This case
+// is taken from the ARIA spec rather than from a dump: Microsoft's markup uses
+// lowercase, so nothing here has been observed in the wild. It is worth pinning
+// because the rule that aria-hidden means "not visible" is now load-bearing for
+// the whole work-account path, and a mixed-case token is the one way that rule
+// can quietly stop holding.
+const mixedCaseAriaHiddenPage = PAGE$('Sign in to your account', `
+    <h1>Enter password</h1>
+    <div>
+        <input type="text" name="loginfmt" value="john@mobilutils.eu"
+            class="moveOffScreen" aria-hidden="True">
+        <input name="passwd" type="password" id="i0118" style="width:300px;height:30px">
+    </div>
+    <input type="submit" id="idSIButton9" value="Sign in" onclick="__record('Sign in')">
+`);
+
 describeWithBrowser('work/school account sign-in', () => {
     let browser;
     let context;
@@ -139,6 +155,23 @@ describeWithBrowser('work/school account sign-in', () => {
         expect(result.state.passwordField).toBe(true);
         expect(result.state.emailField).toBe(false);
         expect(clicks).toEqual([]);
+    }, 30000);
+
+    it('treats a mixed-case aria-hidden token as not visible', async () => {
+        await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: mixedCaseAriaHiddenPage }));
+        await page.goto(`${PASSWORD_URL}&mixedcase=1`);
+
+        const result = await reachPasswordScreen(page, options());
+
+        // "True" is the same token as "true" per the ARIA spec, so the parked
+        // field is still not visible and the page is still the password step.
+        // This passes on the *ordering* fix even if aria-hidden were ignored
+        // entirely, so the assertion that matters is emailField — that is the
+        // rule under test, and the reason the loop-level check cannot be the
+        // only thing standing between this page and a 15 s stall.
+        expect(result.state.emailField).toBe(false);
+        expect(result.reached).toBe(true);
+        expect(result.reason).toBe('password_field');
     }, 30000);
 
     it('reaches the password box when a real username field is on screen too', async () => {
