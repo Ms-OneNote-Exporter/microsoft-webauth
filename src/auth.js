@@ -425,6 +425,22 @@ const BLOCKING_SCREEN_BUTTONS = [
 /** Do not re-click the same unchanged screen more often than this. */
 const BLOCKING_SCREEN_RETRY_MS = 10000;
 
+/**
+ * Dump basenames for the two passes that clear blocking screens.
+ *
+ * They must differ. The first pass runs once, just after the password is
+ * accepted; the watcher then polls for the rest of the login and is where the
+ * screens that arrive *late* turn up — the terms update queued behind a "Stay
+ * signed in?" prompt, typically 20-60 s in. Both passes call
+ * clearBlockingScreens(), which numbers its dumps from 1 within a single call,
+ * and the watcher starts a new call every second. On a shared basename the
+ * late screen would overwrite the earlier pass's dump of a different screen,
+ * and the one that was actually in the way when the login stalled would be the
+ * one lost.
+ */
+const BLOCKING_SCREEN_DUMP = 'debug_blocking_screen';
+const LATE_BLOCKING_SCREEN_DUMP = 'debug_late_blocking_screen';
+
 /** Returns the blocking-screen descriptor matching { url, heading }, or null. */
 function matchBlockingScreen(state) {
     if (!state) return null;
@@ -544,6 +560,7 @@ async function waitForBlockingScreenChange(page, previousSignature, timeout) {
  * @param {{ signatures: Set<string>, lastClickAt: number }} [options.progress]
  * @param {boolean} [options.dodump]
  * @param {boolean} [options.screenshot]  also screenshot each dump
+ * @param {string} [options.dumpFile]      basename for the dumps this call writes
  * @param {() => boolean} [options.shouldStop]
  * @returns {Promise<{ handled: number, reason: string }>}
  */
@@ -555,6 +572,7 @@ async function clearBlockingScreens(page, options = {}) {
         changeTimeout = 20000,
         dodump = false,
         screenshot = false,
+        dumpFile = BLOCKING_SCREEN_DUMP,
         shouldStop = null
     } = options;
 
@@ -592,8 +610,9 @@ async function clearBlockingScreens(page, options = {}) {
         logger.info(`Blocking screen detected: ${screen.name} (${shortUrl(state.url)}). Accepting it...`);
 
         if (dodump) {
-            const displayPath = await dumpPage(page, `debug_blocking_screen_${i + 1}.html`, { screenshot });
-            logger.debug(`[dodump] Blocking screen state dumped to ${displayPath}/debug_blocking_screen_${i + 1}.html`);
+            const fileName = `${dumpFile}_${i + 1}.html`;
+            const displayPath = await dumpPage(page, fileName, { screenshot });
+            logger.debug(`[dodump] Blocking screen state dumped to ${displayPath}/${fileName}`);
         }
 
         let label = null;
@@ -618,6 +637,72 @@ async function clearBlockingScreens(page, options = {}) {
     }
 
     return { handled, reason: 'max_screens' };
+}
+
+/**
+ * Polls for blocking screens until told to stop, clearing any that appear.
+ *
+ * This is the last line of defence for the interstitial screens that arrive
+ * *late*. The pass in step 2.5a runs once, right after the password is
+ * accepted; Microsoft often serves these screens much later — 20-60 s in, once
+ * per account, behind a "Stay signed in?" prompt or behind a terms update that
+ * was itself queued behind something else. The watcher is what catches those,
+ * and until now it caught them blind: it ran with no dumping at all, so a login
+ * killed by a late consent page produced nothing in the dump directory and the
+ * only evidence was the bare "still on <url>" timeout.
+ *
+ * It inherits `dodump`/`screenshot` from the caller so a late screen is captured
+ * the same way an early one is, but under LATE_BLOCKING_SCREEN_DUMP: see the
+ * note on that constant for why the two passes cannot share a basename.
+ *
+ * `progress` is shared with the earlier pass, which is what keeps the watcher
+ * from re-capturing a screen that pass already handled, and the retry cooldown
+ * inside clearBlockingScreens is what keeps it from writing a fresh dump every
+ * second while a screen sits there unchanged.
+ *
+ * @param {import('playwright').Page} page
+ * @param {object} [options]
+ * @param {{ signatures: Set<string>, lastClickAt: number }} [options.progress]
+ * @param {number} [options.pollInterval]  ms between polls
+ * @param {number} [options.maxScreens]    screens to clear per poll
+ * @param {number} [options.stateTimeout]  forwarded to clearBlockingScreens
+ * @param {number} [options.changeTimeout] forwarded to clearBlockingScreens
+ * @param {boolean} [options.dodump]
+ * @param {boolean} [options.screenshot]
+ * @param {() => boolean} options.shouldStop  required; the watcher never ends on its own
+ * @returns {Promise<void>} resolves once shouldStop() has been true for one poll
+ */
+async function watchBlockingScreens(page, options = {}) {
+    const {
+        progress = { signatures: new Set(), lastClickAt: 0 },
+        pollInterval = 1000,
+        maxScreens = 2,
+        stateTimeout = 10000,
+        changeTimeout = 20000,
+        dodump = false,
+        screenshot = false,
+        shouldStop = () => false
+    } = options;
+
+    while (!shouldStop()) {
+        try {
+            await clearBlockingScreens(page, {
+                progress,
+                maxScreens,
+                stateTimeout,
+                changeTimeout,
+                dodump,
+                screenshot,
+                dumpFile: LATE_BLOCKING_SCREEN_DUMP,
+                shouldStop
+            });
+        } catch (e) {
+            // The watcher runs for the whole wait, so anything thrown here would
+            // otherwise be logged once and the loop would carry on regardless.
+            logger.debug(`Blocking screen watcher error: ${e.message}`);
+        }
+        await page.waitForTimeout(pollInterval).catch(() => {});
+    }
 }
 
 /* ------------------------------------------------------------------------- *
@@ -1426,21 +1511,18 @@ async function login(credentials = {}) {
             // A consent screen can still show up after any of the steps above (e.g. a
             // terms update queued behind "Stay signed in?"), so keep clearing them
             // while we wait instead of only checking once up front.
+            //
+            // The watcher dumps and screenshots too: these are the screens that
+            // arrive late, and they are exactly the ones a login dies on without
+            // leaving anything behind to look at.
             let stopWatcher = false;
-            const blockerWatcher = (async () => {
-                while (!stopWatcher) {
-                    try {
-                        await clearBlockingScreens(page, {
-                            progress: blockerProgress,
-                            maxScreens: 2,
-                            shouldStop: () => stopWatcher
-                        });
-                    } catch (e) {
-                        logger.debug(`Blocking screen watcher error: ${e.message}`);
-                    }
-                    await page.waitForTimeout(1000).catch(() => {});
-                }
-            })();
+            const blockerWatcher = watchBlockingScreens(page, {
+                progress: blockerProgress,
+                maxScreens: 2,
+                dodump: credentials.dodump,
+                screenshot,
+                shouldStop: () => stopWatcher
+            });
 
             try {
                 await Promise.race([waitForAuthSuccess(page, finalTargetUrl), blockerWatcher]);
@@ -1558,6 +1640,9 @@ module.exports = {
     // Exported for tests: clears the consent/interrupt screens that Microsoft can
     // inject mid-login (e.g. the Terms of Use update at account.live.com/tou/accrue).
     clearBlockingScreens,
+    // Exported for tests: the loop that polls for those screens after the early
+    // pass, so "a late screen is dumped too" can be asserted without a real login.
+    watchBlockingScreens,
     // Exported for tests: walks the "how do you want to sign in?" screens
     // (passwordless "Get a code to sign in", "Other ways to sign in", method
     // list) and lands on the password box.

@@ -143,6 +143,12 @@ Adding `--screenshot` saves a full-page PNG of the same screen under the same
 basename, so `debug_after_email.html` is accompanied by
 `debug_after_email.png`.
 
+Interstitial screens are captured wherever they turn up, including the ones that
+arrive *late* — Microsoft often serves them 20–60 s into a login, behind a "Stay
+signed in?" prompt. Those are written as `debug_late_blocking_screen_N.html`,
+kept separate from the `debug_blocking_screen_N.html` of the earlier pass so the
+two cannot overwrite each other.
+
 The HTML says *which* screen this was; the screenshot says what it *looked* like,
 which is what answers the questions a dump usually gets asked — was something
 covering the button, was there a banner or an overlay, did the page render at all.
