@@ -128,6 +128,20 @@ function promptUser(query) {
  * the unauthenticated marketing page (onenote.cloud.microsoft/en-us) can never
  * satisfy this. A bare hostname check would, and did: it caused premature
  * auth saving.
+ *
+ * This is matched against `url.pathname` and never against the serialised URL.
+ * A substring match on the whole string accepts a notebooks path that is not a
+ * path at all — a `?next=/copilotnotebooks` on the marketing page, or a
+ * `?returnUrl=/notebooks` on a login screen — which is the same class of false
+ * positive as the bare-hostname check, one level removed. It decides when live
+ * auth state gets written to disk, so the check is worth making an actual
+ * invariant about the path.
+ *
+ * Deliberately not constrained to a host allowlist: OneNote notebooks are
+ * SharePoint-backed, and a tenant served from another host would be a real
+ * successful login reported as a failure. Requiring the *path* is enough to
+ * separate the app from the marketing page, and it cannot go stale the way a
+ * host list would.
  */
 const ONENOTE_APP_PATH = /\/copilotnotebooks\b|\/notebooks\b/;
 
@@ -153,7 +167,7 @@ async function waitForAuthSuccessProbe(page, targetUrl, timeoutMs) {
             page.waitForSelector('div[role="row"]', { state: 'visible', timeout: timeoutMs }),
         ]
         : [
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: timeoutMs }),
+            page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs }),
             ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
                 page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })),
         ];
@@ -180,7 +194,7 @@ async function waitForAuthSuccess(page, targetUrl) {
         logger.info('Waiting for redirection to authenticated notebooks interface...');
         await Promise.any([
             // Primary: the URL must be the authenticated app, not the marketing page
-            page.waitForURL(url => ONENOTE_APP_PATH.test(url.toString()), { timeout: 60000 }),
+            page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: 60000 }),
             // Fallback UI elements that only appear when actually signed in
             ...ONENOTE_SIGNED_IN_MARKERS.map(marker =>
                 page.waitForSelector(marker, { state: 'visible', timeout: 60000 })),

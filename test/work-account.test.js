@@ -229,4 +229,25 @@ describeWithBrowser('work/school account sign-in', () => {
         await expect(waitForAuthSuccessProbe(page, 'https://onenote.cloud.microsoft/notebooks', 2000))
             .resolves.toBe(false);
     }, 30000);
+
+    // The next two pin *where* in the URL the path has to appear. Matching the
+    // serialised URL means a notebooks path anywhere satisfies the check — in a
+    // query parameter, on any host. Both of these are unauthenticated pages that
+    // the check must reject, and both carry the path in a place that is not a
+    // path. The marketing page is the one that already caused premature auth
+    // saving once, so it is the one worth being strict about.
+    it('ignores a notebooks path carried in the query string', async () => {
+        await page.goto('https://onenote.cloud.microsoft/en-us?next=/copilotnotebooks');
+
+        // The body is the marketing page; only the query string names the app.
+        await expect(waitForAuthSuccessProbe(page, 'https://onenote.cloud.microsoft/notebooks', 2000))
+            .resolves.toBe(false);
+    }, 30000);
+
+    it('ignores a notebooks path carried in a redirect parameter on a login host', async () => {
+        await page.goto('https://login.microsoftonline.com/common/oauth2/v2.0/authorize?returnUrl=/notebooks');
+
+        await expect(waitForAuthSuccessProbe(page, 'https://onenote.cloud.microsoft/notebooks', 2000))
+            .resolves.toBe(false);
+    }, 30000);
 });
