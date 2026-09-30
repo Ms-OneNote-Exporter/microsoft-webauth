@@ -1,5 +1,4 @@
-const fs = require('fs');
-const { chromium } = require('playwright');
+const { chromium, describeWithBrowser } = require('./helpers/browser-suite');
 
 jest.mock('../src/utils/logger', () => ({
     info: jest.fn(),
@@ -14,28 +13,6 @@ jest.mock('../src/utils/logger', () => ({
 
 const { reachPasswordScreen, waitForAuthSuccessProbe, waitForAuthSuccess } = require('../src/auth');
 
-/**
- * These tests replay a *work/school* account sign-in, using markup taken from the
- * real dumps of a successful login that the tool nevertheless reported as failed
- * (src/logs/dumps/2026-09-28_00h54). They are stubbed over page.route so nothing
- * touches the network and the suite is deterministic.
- *
- * The consumer account (login.live.com, Fluent UI) is covered in
- * sign-in-method.test.js; this suite covers the other half of the world.
- */
-const describeWithBrowser = (() => {
-    let executable = null;
-    try {
-        executable = chromium.executablePath();
-    } catch (_) {
-        // playwright could not resolve a path at all
-    }
-    if (!executable || !fs.existsSync(executable)) {
-        console.warn('Skipping work-account tests: chromium is not installed. Run `npx playwright install chromium`.');
-        return describe.skip;
-    }
-    return describe;
-})();
 
 const PAGE$ = (title, body) => `<!DOCTYPE html><html><head><title>${title}</title></head><body>${body}</body></html>`;
 

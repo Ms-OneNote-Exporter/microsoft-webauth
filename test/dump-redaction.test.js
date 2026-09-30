@@ -2,6 +2,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const { chromium, describeWithBrowser } = require('./helpers/browser-suite');
+
 jest.mock('../src/utils/logger', () => {
     // Required inside the factory: jest.mock factories may not close over
     // out-of-scope variables, so a shared temp dir has to be built here.
@@ -22,23 +24,6 @@ jest.mock('../src/utils/logger', () => {
 
 const logger = require('../src/utils/logger');
 
-/**
- * These tests drive a real browser, so a missing chromium must skip rather than
- * fail the release build.
- */
-const describeWithBrowser = (() => {
-    let executable = null;
-    try {
-        executable = require('playwright').chromium.executablePath();
-    } catch (_) {
-        // playwright could not resolve a path at all
-    }
-    if (!executable || !fs.existsSync(executable)) {
-        console.warn('Skipping dump-redaction tests: chromium is not installed. Run `npx playwright install chromium`.');
-        return describe.skip;
-    }
-    return describe;
-})();
 
 const SECRET = 'AnamazingPass4Microsoft@!';
 const PPFT = 'cHQeYzI1NS5TLkJqc09XTjFOR0ZaR1JEWUJB';
@@ -64,14 +49,12 @@ const passwordPage = page$('Enter your password', `
 const PASSWORD_URL = 'https://login.live.com/oauth20_authorize.srf?stage=1';
 
 describeWithBrowser('dumpPage', () => {
-    let chromium;
     let browser;
     let context;
     let page;
     let dumpDir;
 
     beforeAll(async () => {
-        chromium = require('playwright').chromium;
         browser = await chromium.launch({ headless: true });
     });
 
