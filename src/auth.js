@@ -603,6 +603,14 @@ const CLICKABLE_SELECTOR = 'a[href], button, input[type="submit"], input[type="b
 const PASSWORD_FIELD_SELECTOR = 'input[name="passwd"], input[type="password"]';
 
 /**
+ * How long to let the next sign-in screen arrive after submitting the email
+ * step, before handing over to reachPasswordScreen(). A settle window rather
+ * than a decision: the screen that follows is often not the password box, and
+ * reachPasswordScreen handles all of them.
+ */
+const EMAIL_STEP_SETTLE_TIMEOUT = 5000;
+
+/**
  * Reads what the current sign-in screen actually offers, in a single round trip.
  *
  * Everything is answered from one evaluate() so the reading is a consistent
@@ -1082,9 +1090,17 @@ async function login(credentials = {}) {
                 // in the DOM for the rest of the login, so "hidden" never happens
                 // and this used to burn the full timeout on every work account.
                 // The next step appearing is the real signal that we have moved on.
+                //
+                // Neither branch fires when the next screen is *not* the password
+                // box — a method list, "Stay signed in?", an approval prompt — so
+                // this is really only a settle window, and on those screens the
+                // whole timeout was dead time before reachPasswordScreen() below
+                // did the actual polling. Kept, but at 5s: enough for the next
+                // screen to paint before the username-error check that follows,
+                // short enough not to dominate the login.
                 await Promise.race([
-                    page.waitForSelector(PASSWORD_FIELD_SELECTOR, { state: 'visible', timeout: 15000 }).then(() => 'password'),
-                    page.waitForSelector('input[name="loginfmt"]', { state: 'hidden', timeout: 15000 }).then(() => 'advanced'),
+                    page.waitForSelector(PASSWORD_FIELD_SELECTOR, { state: 'visible', timeout: EMAIL_STEP_SETTLE_TIMEOUT }).then(() => 'password'),
+                    page.waitForSelector('input[name="loginfmt"]', { state: 'hidden', timeout: EMAIL_STEP_SETTLE_TIMEOUT }).then(() => 'advanced'),
                 ]).catch(() => {
                     logger.debug('Email form did not visibly change yet; the sign-in method step will wait for the next screen.');
                 });
