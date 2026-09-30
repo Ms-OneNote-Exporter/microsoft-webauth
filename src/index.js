@@ -22,9 +22,17 @@ program
     .option('--password <password>', 'Microsoft account password')
     .option('--notheadless', 'Run in visible browser mode for debugging')
     .option('--dodump', 'Dump HTML content to files for debugging')
+    .option('--screenshot', 'With --dodump, also save a PNG screenshot of each dumped page')
     .option('--against <target>', 'Target service: onenote (default) or outlook', 'onenote')
     .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
+        // Screenshots are only ever taken of a dumped page, so on their own they
+        // would be an option that silently does nothing — the kind of flag a
+        // user debugs for an hour. It turns the dump on instead, and says so.
+        if (options.screenshot && !options.dodump) {
+            logger.warn('--screenshot only applies to the pages written by --dodump; enabling --dodump as well.');
+            options.dodump = true;
+        }
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
         await login({ ...options, targetUrl });
     });

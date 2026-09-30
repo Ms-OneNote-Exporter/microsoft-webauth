@@ -543,6 +543,7 @@ async function waitForBlockingScreenChange(page, previousSignature, timeout) {
  * @param {object} [options]
  * @param {{ signatures: Set<string>, lastClickAt: number }} [options.progress]
  * @param {boolean} [options.dodump]
+ * @param {boolean} [options.screenshot]  also screenshot each dump
  * @param {() => boolean} [options.shouldStop]
  * @returns {Promise<{ handled: number, reason: string }>}
  */
@@ -553,6 +554,7 @@ async function clearBlockingScreens(page, options = {}) {
         stateTimeout = 10000,
         changeTimeout = 20000,
         dodump = false,
+        screenshot = false,
         shouldStop = null
     } = options;
 
@@ -590,7 +592,7 @@ async function clearBlockingScreens(page, options = {}) {
         logger.info(`Blocking screen detected: ${screen.name} (${shortUrl(state.url)}). Accepting it...`);
 
         if (dodump) {
-            const displayPath = await dumpPage(page, `debug_blocking_screen_${i + 1}.html`);
+            const displayPath = await dumpPage(page, `debug_blocking_screen_${i + 1}.html`, { screenshot });
             logger.debug(`[dodump] Blocking screen state dumped to ${displayPath}/debug_blocking_screen_${i + 1}.html`);
         }
 
@@ -882,6 +884,7 @@ async function submitSignInForm(page) {
  * @param {number} [options.stateTimeout]   how long to wait for the first screen
  * @param {number} [options.transitionTimeout] how long to wait after each click
  * @param {boolean} [options.dodump]
+ * @param {boolean} [options.screenshot]   also screenshot the dump
  * @param {string} [options.dumpFile]        basename written under the dump dir
  * @returns {Promise<{ reached: boolean, reason: string, steps: number, state: object|null }>}
  */
@@ -891,6 +894,7 @@ async function reachPasswordScreen(page, options = {}) {
         stateTimeout = 15000,
         transitionTimeout = 10000,
         dodump = false,
+        screenshot = false,
         dumpFile = 'debug_intermediate_screen'
     } = options;
 
@@ -929,7 +933,7 @@ async function reachPasswordScreen(page, options = {}) {
 
         if (dodump && !dumped) {
             dumped = true;
-            const displayPath = await dumpPage(page, `${dumpFile}.html`);
+            const displayPath = await dumpPage(page, `${dumpFile}.html`, { screenshot });
             logger.debug(`[dodump] Intermediate screen state dumped to ${displayPath}/${dumpFile}.html`);
         }
 
@@ -994,14 +998,85 @@ async function reachPasswordScreen(page, options = {}) {
  * form is about to POST, so blanking them in the live DOM would break the very
  * login being debugged. A clone cannot affect the page.
  *
+ * With `screenshot`, a PNG of the rendered page is written beside it under the
+ * same basename, because the HTML serialisation says which screen this was but
+ * nothing about how it *looked*: which element covered the button, whether a
+ * banner or an overlay was in the way, how the screen was laid out on the
+ * viewport. Several of the failures this tool reports ("the password box never
+ * appeared", "stuck on <url>") are resolved by a glance at the picture.
+ *
+ * The PNG is not scrubbed, and cannot be: it is a bitmap. That costs nothing in
+ * credential terms — a password field renders as dots, and nothing else on a
+ * Microsoft login screen is secret in a way the redacted HTML does not already
+ * disclose — but a screenshot *does* show the number-match MFA code, which the
+ * HTML dump and the terminal log both show too. So the screenshots are as
+ * sensitive as the dumps and are written to the same gitignored directory.
+ *
  * @param {import('playwright').Page} page
  * @param {string} fileName  basename, e.g. debug_after_password.html
+ * @param {object} [options]
+ * @param {boolean} [options.screenshot] also write <basename>.png beside the HTML
+ * @returns {Promise<string>} the display path the dump was written to
  */
-async function dumpPage(page, fileName) {
+async function dumpPage(page, fileName, options = {}) {
+    const { screenshot = false } = options;
     const dumpDir = await logger.getDumpDir();
     const displayPath = logger.getDumpDisplayPath();
     await fs.writeFile(path.join(dumpDir, fileName), await redactedPageContent(page));
+    if (screenshot) await screenshotPage(page, dumpDir, displayPath, fileName);
     return displayPath;
+}
+
+/**
+ * The screenshot that accompanies a dump: debug_after_email.html ->
+ * debug_after_email.png. Derived from the HTML basename so the pair is found
+ * together, and an unexpected extension cannot produce "x.html.png".
+ *
+ * @param {string} fileName
+ * @returns {string}
+ */
+function screenshotNameFor(fileName) {
+    return fileName.replace(/\.html?$/i, '') + '.png';
+}
+
+/**
+ * How long a screenshot may take before it is given up on. Playwright's own
+ * default is 30 s, which is longer than most of the waits it would sit inside:
+ * a dump taken while the login is already behind schedule must not become the
+ * slowest thing in it.
+ */
+const SCREENSHOT_TIMEOUT_MS = 15000;
+
+/**
+ * Screenshots the page into the dump directory, never throwing.
+ *
+ * A capture is the one part of a dump that depends on the page being alive and
+ * still rendering, and it is by far the least important part: the HTML dump is
+ * already on disk by the time this runs. So every failure — the page navigated
+ * away mid-capture, the tab was closed, a headless browser that cannot rasterise
+ * — is a warning, never a failed login.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} dumpDir
+ * @param {string} displayPath
+ * @param {string} fileName  basename of the HTML dump this accompanies
+ */
+async function screenshotPage(page, dumpDir, displayPath, fileName) {
+    const pngName = screenshotNameFor(fileName);
+    try {
+        // fullPage: the point is to see the screen as it is presented, and a
+        // Microsoft login page that scrolls below the fold — the method list, the
+        // footer links — is exactly the case where a viewport-only capture
+        // answers "nothing is here" when something is.
+        await page.screenshot({
+            path: path.join(dumpDir, pngName),
+            fullPage: true,
+            timeout: SCREENSHOT_TIMEOUT_MS
+        });
+        logger.debug(`[screenshot] Saved ${displayPath}/${pngName}`);
+    } catch (e) {
+        logger.warn(`[screenshot] Could not capture ${pngName}: ${e.message} (the HTML dump was still written)`);
+    }
 }
 
 /** Placeholder written over any redacted value, so a scrubbed dump is obvious. */
@@ -1063,7 +1138,7 @@ async function redactedPageContent(page) {
 }
 
 async function login(credentials = {}) {
-    const { email, password, targetUrl, authFile } = credentials;
+    const { email, password, targetUrl, authFile, screenshot } = credentials;
     const isAutomated = !!(email && password);
     const headless = !credentials.notheadless && isAutomated;
     // Use targetUrl if provided, otherwise default to ONENOTE_URL for backward compatibility
@@ -1181,7 +1256,7 @@ async function login(credentials = {}) {
             } catch (e) {
                 logger.error(`Failed to enter email: ${e.message}`);
                 if (credentials.dodump) {
-                    const displayPath = await dumpPage(page, 'debug_login_error_email.html');
+                    const displayPath = await dumpPage(page, 'debug_login_error_email.html', { screenshot });
                     logger.error(`Email submission failed. HTML dumped to ${displayPath}/debug_login_error_email.html`);
                 }
                 throw e;
@@ -1189,7 +1264,7 @@ async function login(credentials = {}) {
 
             // Proactive dump after email step (before MFA detection)
             if (credentials.dodump) {
-                const displayPath = await dumpPage(page, 'debug_after_email.html');
+                const displayPath = await dumpPage(page, 'debug_after_email.html', { screenshot });
                 logger.debug(`[dodump] Post-email state dumped to ${displayPath}/debug_after_email.html`);
             }
 
@@ -1199,7 +1274,7 @@ async function login(credentials = {}) {
             // read from the DOM rather than guessed from a race between text
             // selectors. See reachPasswordScreen() above.
             try {
-                const nav = await reachPasswordScreen(page, { dodump: credentials.dodump });
+                const nav = await reachPasswordScreen(page, { dodump: credentials.dodump, screenshot });
 
                 logger.debug(`Sign-in method step: reached=${nav.reached} (${nav.reason}) after ${nav.steps} step(s)`);
                 if (nav.state) {
@@ -1251,7 +1326,7 @@ async function login(credentials = {}) {
                 }
             } catch (e) {
                 if (credentials.dodump) {
-                    const displayPath = await dumpPage(page, 'debug_login_error_password.html');
+                    const displayPath = await dumpPage(page, 'debug_login_error_password.html', { screenshot });
                     logger.error(`Password entry failed. HTML dumped to ${displayPath}/debug_login_error_password.html`);
                 }
                 throw e;
@@ -1259,7 +1334,7 @@ async function login(credentials = {}) {
 
             // Proactive dump after password submission (before post-password MFA check)
             if (credentials.dodump) {
-                const displayPath = await dumpPage(page, 'debug_after_password.html');
+                const displayPath = await dumpPage(page, 'debug_after_password.html', { screenshot });
                 logger.debug(`[dodump] Post-password state dumped to ${displayPath}/debug_after_password.html`);
             }
 
@@ -1270,7 +1345,8 @@ async function login(credentials = {}) {
             try {
                 const cleared = await clearBlockingScreens(page, {
                     progress: blockerProgress,
-                    dodump: credentials.dodump
+                    dodump: credentials.dodump,
+                    screenshot
                 });
                 logger.debug(`Blocking screen pass: handled=${cleared.handled} (${cleared.reason})`);
             } catch (e) {
@@ -1291,7 +1367,7 @@ async function login(credentials = {}) {
                 ]).catch(() => null);
 
                 if (credentials.dodump) {
-                    const displayPath = await dumpPage(page, 'debug_post_password_mfa.html');
+                    const displayPath = await dumpPage(page, 'debug_post_password_mfa.html', { screenshot });
                     logger.debug(`[dodump] Post-password MFA screen state dumped to ${displayPath}/debug_post_password_mfa.html`);
                 }
 
@@ -1379,7 +1455,7 @@ async function login(credentials = {}) {
                     }
                 }
                 if (credentials.dodump) {
-                    const displayPath = await dumpPage(page, 'debug_login_error_success.html');
+                    const displayPath = await dumpPage(page, 'debug_login_error_success.html', { screenshot });
                     logger.error(`Success detection failed. HTML dumped to ${displayPath}/debug_login_error_success.html`);
                 }
                 throw e;
