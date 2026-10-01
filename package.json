@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/auth.js",
     "./cli": "./src/index.js",
+    "./config": "./src/config.js",
     "./package.json": "./package.json"
   },
   "bin": {
