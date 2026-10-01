@@ -1,11 +1,13 @@
 const chalk = require('chalk');
 const fs = require('fs-extra');
 const path = require('path');
+const { resolveLogDir } = require('./logPaths');
 
 class Logger {
     constructor() {
         this.months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-        this.logFilePath = path.resolve(__dirname, '../logs/app.log');
+        this.logDir = resolveLogDir();
+        this.logFilePath = path.join(this.logDir, 'app.log');
 
          // Initialize dump directory name once per execution
         const now = new Date();
@@ -18,8 +20,51 @@ class Logger {
          // Format: YYYY-MM-DD_HHhMM
         this.dumpSubDir = `${yyyy}-${mm}-${dd}_${hh}h${min}`;
 
-         // Ensure logs directory exists
-        fs.ensureDirSync(path.dirname(this.logFilePath));
+         // Ensure logs directory exists. Restricted permissions because the dump
+        // files written next to app.log contain the authenticated DOM of a real
+        // Microsoft account: cookies, tenant hostnames and note titles. The dump
+        // path redacts known credential fields, but the surrounding page does
+        // not, so the directory is owner-only rather than merely gitignored.
+        this._ensurePrivateDir(this.logDir);
+        this._tightenExistingLogFile();
+    }
+
+    /**
+     * Brings an existing app.log down to owner-only.
+     *
+     * Files this process creates are 0600 from the start, but a log written by
+     * an earlier version - which had no `mode` at all - is still 0644, and
+     * appendFileSync's `mode` only applies at creation. One chmod at startup is
+     * enough to close that off.
+     */
+    _tightenExistingLogFile() {
+        try {
+            const stats = fs.statSync(this.logFilePath);
+            if ((stats.mode & 0o077) !== 0) {
+                fs.chmodSync(this.logFilePath, 0o600);
+            }
+        } catch (e) {
+            // No log file yet, or chmod unsupported: not fatal.
+        }
+    }
+
+    /**
+     * Creates `dir` and forces it to owner-only.
+     *
+     * fs.ensureDirSync honours the process umask, so on a permissive umask the
+     * dumps would end up world-readable. chmod makes it explicit rather than
+     * dependent on the environment.
+     *
+     * @param {string} dir - Directory to create
+     */
+    _ensurePrivateDir(dir) {
+        fs.ensureDirSync(dir);
+        try {
+            fs.chmodSync(dir, 0o700);
+        } catch (e) {
+            // A filesystem that does not support chmod is not a reason to fail
+            // a login; the log is a diagnostic aid, not the product.
+        }
     }
 
     _getTimestamp() {
@@ -32,21 +77,31 @@ class Logger {
 
     /**
      * Returns the absolute path to the current session's dump directory.
-     * Ensures the directory exists.
+     * Ensures the directory exists, owner-only.
      * @returns {Promise<string>}
      */
     async getDumpDir() {
-        const dumpDir = path.resolve(__dirname, '../logs/dumps', this.dumpSubDir);
-        await fs.ensureDir(dumpDir);
+        const dumpDir = path.join(this.logDir, 'dumps', this.dumpSubDir);
+        fs.ensureDirSync(dumpDir);
+        try {
+            fs.chmodSync(dumpDir, 0o700);
+        } catch (e) {
+            // See _ensurePrivateDir: not fatal.
+        }
         return dumpDir;
     }
 
     /**
      * Returns a user-friendly relative path for logging.
+     *
+     * Relative to the cwd rather than a hardcoded `logs/dumps/...`, because the
+     * log directory is no longer always <package>/logs: an installed copy writes
+     * to the XDG state dir, and ms-onenote-exporter points every step at one
+     * shared directory. A fixed string would name a path that does not exist.
      * @returns {string}
      */
     getDumpDisplayPath() {
-        return `logs/dumps/${this.dumpSubDir}`;
+        return path.relative(process.cwd(), path.join(this.logDir, 'dumps', this.dumpSubDir)) || '.';
     }
 
     _stripColors(str) {
@@ -94,8 +149,10 @@ class Logger {
             plainMessage = `${plainTimestamp} ${plainLevelTag} ${message}`;
         }
 
-         // Append to log file
-        fs.appendFileSync(this.logFilePath, plainMessage + '\n');
+         // Append to log file. `mode` only applies at creation, so an app.log
+        // written by an earlier version stays 0644; _tightenExistingLogFile
+        // brings that down to owner-only on the next run.
+        fs.appendFileSync(this.logFilePath, plainMessage + '\n', { mode: 0o600 });
 
         return formattedMessage;
     }
