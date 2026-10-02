@@ -87,15 +87,46 @@ describe('Auth Module', () => {
         });
 
         it('should handle network errors gracefully', async () => {
-            // Create a dummy auth file
-            await fs.writeJson('/tmp/test-auth.json', { test: true });
-            
+            // A real storage state, not the `{ test: true }` this used to write.
+            // That fixture was never a usable auth file — it only passed because
+            // nothing looked — and it is now rejected outright by
+            // verifyAuthStateFile(), so leaving it would have quietly turned
+            // this test into an assertion about malformed files.
+            await fs.writeJson('/tmp/test-auth.json', { cookies: [], origins: [] });
+
             const { checkAuth } = require('../src/auth');
             // Use mock URL that won't actually connect
             const isAuth = await checkAuth('https://mock.test/nonexistent');
-            
+
             // Should return true on error (conservative approach)
             expect(isAuth).toBe(true);
+        }, 10000);
+
+        // #24 split checkAuth into a boolean and a reason, because an exit code
+        // cannot inherit its conservative "true" on a failed verification. The
+        // conservative default stays exactly where it belongs — deciding whether
+        // to keep the auth file — and the CLI uses the reason instead.
+        it('should not delete a valid session when verification fails', async () => {
+            await fs.writeJson('/tmp/test-auth.json', { cookies: [{ name: 'ESAuth', value: 'x' }], origins: [] });
+
+            const { verifyAuth } = require('../src/auth');
+            const status = await verifyAuth('https://mock.test/nonexistent');
+
+            expect(status.reason).toBe('unverifiable');
+            expect(status.authenticated).toBe(false);
+            // The auth file is still there: the check failed, which is not
+            // evidence that the session is bad.
+            expect(await fs.pathExists('/tmp/test-auth.json')).toBe(true);
+        }, 10000);
+
+        it('should reject an auth file that is not a storage state', async () => {
+            await fs.writeJson('/tmp/test-auth.json', { test: true });
+
+            const { verifyAuth } = require('../src/auth');
+            const status = await verifyAuth();
+
+            expect(status.authenticated).toBe(false);
+            expect(status.reason).toBe('unusable_auth_file');
         }, 10000);
     });
 

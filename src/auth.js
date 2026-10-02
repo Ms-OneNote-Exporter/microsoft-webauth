@@ -161,6 +161,23 @@ const OUTLOOK_SIGNED_IN_MARKERS = [
 /** How long success detection waits before giving up. */
 const AUTH_SUCCESS_TIMEOUT = 60000;
 
+/**
+ * How long `check` waits for the navigation, and then for the page to settle.
+ *
+ * Split in two because they answer different questions. CHECK_NAV_TIMEOUT is
+ * the old `page.goto` timeout and is about the network. CHECK_SETTLE_TIMEOUT
+ * replaces the hardcoded 2 s sleep that used to stand in for "wait and see": a
+ * session being redirected can take several seconds to get there, and cutting
+ * that short is what made a dead session read as live.
+ *
+ * Sized against what `check` is for. It is a gate that decides whether to
+ * export a notebook, so a few seconds of certainty is cheap next to a wrong
+ * answer; and it only ever waits this long when the session is already broken.
+ * A live session resolves on the first signal, usually in well under a second.
+ */
+const CHECK_NAV_TIMEOUT = 15000;
+const CHECK_SETTLE_TIMEOUT = 10000;
+
 /** Outlook and OneNote are recognised differently, so the target picks the set. */
 const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.cloud.microsoft');
 
@@ -185,13 +202,18 @@ const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.
  *
  * @returns {{label: string, wait: Promise<unknown>}[]}
  */
-function authSuccessAttempts(page, targetUrl, timeoutMs) {
-    const markerWaits = (markers, kind) => markers.map(marker => ({
+function authSuccessMarkerAttempts(page, targetUrl, timeoutMs) {
+    const outlook = isOutlookTarget(targetUrl);
+    const markers = outlook ? OUTLOOK_SIGNED_IN_MARKERS : ONENOTE_SIGNED_IN_MARKERS;
+    const kind = outlook ? 'Outlook marker' : 'OneNote marker';
+    return markers.map(marker => ({
         label: `${kind} "${marker}"`,
         wait: page.waitForSelector(marker, { state: 'visible', timeout: timeoutMs })
     }));
+}
 
-    if (isOutlookTarget(targetUrl)) return markerWaits(OUTLOOK_SIGNED_IN_MARKERS, 'Outlook marker');
+function authSuccessAttempts(page, targetUrl, timeoutMs) {
+    if (isOutlookTarget(targetUrl)) return authSuccessMarkerAttempts(page, targetUrl, timeoutMs);
 
     return [
         {
@@ -200,7 +222,7 @@ function authSuccessAttempts(page, targetUrl, timeoutMs) {
             wait: page.waitForURL(url => ONENOTE_APP_PATH.test(url.pathname), { timeout: timeoutMs })
         },
         // Fallback UI elements that only appear when actually signed in
-        ...markerWaits(ONENOTE_SIGNED_IN_MARKERS, 'OneNote marker')
+        ...authSuccessMarkerAttempts(page, targetUrl, timeoutMs)
     ];
 }
 
@@ -1222,6 +1244,98 @@ async function redactedPageContent(page) {
     }, REDACTED).catch(e => `<!-- Error redacting or reading page: ${e.message} -->`);
 }
 
+/**
+ * Confirms the auth state file really landed on disk as parseable JSON.
+ *
+ * A login is only "successful" if there is something to be successful *with*.
+ * `context.storageState({ path })` and `fs.writeJson()` both report failure by
+ * throwing, but neither of them guarantees success: a path that resolves
+ * somewhere unexpected, a filesystem that swallows the write, or a file left
+ * truncated by a crash mid-write all end the login with a cheerful
+ * "Authentication successful!" and no usable state behind it. This re-reads
+ * what was written, so "successful" is a statement about the disk rather than
+ * about two calls that returned.
+ *
+ * The shape check is the part that matters. Playwright's storageState is
+ * `{ cookies: [...], origins: [...] }`, and `getAuthenticatedContext` /
+ * `checkAuth` both feed the path straight to `browser.newContext({ storageState
+ * })`. A file that exists and parses but has no `cookies` array would be
+ * rejected there — a login that reports success and then produces a context
+ * that cannot authenticate anything, which is precisely the silent failure this
+ * whole change exists to eliminate.
+ *
+ * @param {string} authFilePath  the path login() wrote to
+ * @returns {Promise<{ ok: boolean, reason: string, detail: string }>}
+ *   `ok` is true only when the file exists, parses as JSON and has a `cookies`
+ *   array. `reason` is a stable short code; `detail` is for the log.
+ */
+async function verifyAuthStateFile(authFilePath) {
+    if (!(await fs.pathExists(authFilePath))) {
+        return {
+            ok: false,
+            reason: 'missing',
+            detail: `${authFilePath} does not exist`
+        };
+    }
+
+    let state;
+    try {
+        state = await fs.readJson(authFilePath);
+    } catch (e) {
+        // A truncated or half-written file lands here, and is the most likely
+        // real-world shape of this failure.
+        return {
+            ok: false,
+            reason: 'unreadable',
+            detail: `${authFilePath} is not readable JSON: ${e.message}`
+        };
+    }
+
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+        return {
+            ok: false,
+            reason: 'malformed',
+            detail: `${authFilePath} does not contain a Playwright storage-state object`
+        };
+    }
+
+    if (!Array.isArray(state.cookies)) {
+        return {
+            ok: false,
+            reason: 'malformed',
+            detail: `${authFilePath} has no "cookies" array, so it is not a usable auth state`
+        };
+    }
+
+    return { ok: true, reason: 'written', detail: `${authFilePath} written with ${state.cookies.length} cookie(s)` };
+}
+
+/**
+ * Runs the login flow.
+ *
+ * Resolves `true` only when *both* halves of "logged in" held: the session
+ * reached the authenticated app, and the auth state file was then written and
+ * verified on disk. Resolves `false` for every failure, and never throws.
+ *
+ * The never-throws part is the fix for #24. This function used to catch every
+ * error, log it, and resolve `undefined`, so a caller had no way to tell a
+ * completed login from one that died at the password prompt — and `src/index.js`
+ * had nothing to translate into a process exit code, so a failed login exited 0
+ * and every shell script and CI step built on it reported success. Throwing
+ * instead would fix the CLI but break the library contract: this is also
+ * exported as the package main, and ms-onenote-exporter awaits it without a
+ * try/catch. A boolean is the one shape that is useful to both.
+ *
+ * @param {object} [credentials]
+ * @param {string} [credentials.email]
+ * @param {string} [credentials.password]
+ * @param {string} [credentials.targetUrl]
+ * @param {string} [credentials.authFile]
+ * @param {boolean} [credentials.notheadless]
+ * @param {boolean} [credentials.dodump]
+ * @param {boolean} [credentials.screenshot]
+ * @returns {Promise<boolean>} true when the login succeeded and the auth file is on disk
+ */
 async function login(credentials = {}) {
     const { email, password, targetUrl, authFile, screenshot } = credentials;
     const isAutomated = !!(email && password);
@@ -1255,20 +1369,27 @@ async function login(credentials = {}) {
     // Prepare files (backup existing if needed, create directory)
     await checkAndPrepareFiles(filePath);
 
-    const browser = await chromium.launch({ headless: !!headless });
-    const context = await browser.newContext({
-        // Disable WebAuthn/FIDO hardware key prompts
-        ignoreHTTPSErrors: false,
-    });
-    const page = await context.newPage();
-
-    // Dismiss any native browser dialogs (alert/confirm/prompt) automatically
-    page.on('dialog', async dialog => {
-        logger.debug(`[dialog] Auto-dismissing native dialog: type=${dialog.type()}, message="${dialog.message()}"`);
-        await dialog.dismiss();
-    });
+    // Declared out here so the finally can close it, but *launched* inside the
+    // try. It used to sit above it, which meant a missing Chromium — the single
+    // most common setup failure — rejected out of login() before any handler
+    // here ran, leaving the caller with an unhandled rejection instead of the
+    // false it now gets.
+    let browser = null;
 
     try {
+        browser = await chromium.launch({ headless: !!headless });
+        const context = await browser.newContext({
+            // Disable WebAuthn/FIDO hardware key prompts
+            ignoreHTTPSErrors: false,
+        });
+        const page = await context.newPage();
+
+        // Dismiss any native browser dialogs (alert/confirm/prompt) automatically
+        page.on('dialog', async dialog => {
+            logger.debug(`[dialog] Auto-dismissing native dialog: type=${dialog.type()}, message="${dialog.message()}"`);
+            await dialog.dismiss();
+        });
+
         // Inject WebAuthn override BEFORE any navigation.
         // navigator.credentials.create() triggers a native OS-level dialog that
         // Playwright cannot dismiss via DOM clicks. Rejecting it programmatically
@@ -1571,14 +1692,30 @@ async function login(credentials = {}) {
             loginTime: new Date().toISOString()
         });
 
+        // Reaching the app and writing the file are two separate claims, and
+        // only the second one tells the caller there is something to log in
+        // with. Reading it back is what separates "the login worked" from "the
+        // login worked and the file is actually usable" — the distinction the
+        // issue's exit-code rule turns on.
+        const written = await verifyAuthStateFile(filePath);
+        if (!written.ok) {
+            logger.error(`Login reached the authenticated interface but the auth file is not usable (${written.reason}): ${written.detail}`);
+            logger.error('Treating this as a failed login: there is no usable state to save.');
+            return false;
+        }
+
         logger.success(`Authentication successful! State saved to ${filePath}`);
+        return true;
     } catch (error) {
         logger.error('Authentication failed or cancelled:', error);
         if (isAutomated) {
             logger.debug('Possible cause: incorrect credentials, MFA requirement, or selector change.');
         }
+        return false;
     } finally {
-        await browser.close();
+        if (browser) {
+            await browser.close().catch(() => { });
+        }
     }
 }
 
@@ -1591,24 +1728,68 @@ async function getAuthenticatedContext(browser, authFilePath) {
     }
 }
 
-async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
+/**
+ * Checks the saved session and says which of the three possible answers it got.
+ *
+ * A boolean cannot carry this. "Not logged in" and "could not tell" are very
+ * different to a caller, and this function has been forced to return `true` for
+ * both for a good reason: on a network error the conservative move is to leave
+ * the auth file alone rather than delete a possibly-valid session on the
+ * strength of a DNS blip. That decision is right for the *data* and wrong for
+ * the *exit code*, which is why both answers used to collapse into one `true`
+ * and the `check` command could not fail.
+ *
+ * So the decision is split rather than reversed. verifyAuth() keeps the
+ * distinction; checkAuth() below keeps the old conservative boolean, unchanged,
+ * for the library callers that depend on it.
+ *
+ * `unverifiable` deliberately does not touch the auth file: the state on disk
+ * may be perfectly good, and the only thing that failed was the check.
+ *
+ * @param {string} [targetUrl] ONENOTE_URL or OUTLOOK_URL
+ * @param {string} [authFilePath]
+ * @returns {Promise<{ authenticated: boolean, reason: string, detail: string }>}
+ *   `reason` is one of `authenticated`, `no_auth_file`, `unusable_auth_file`,
+ *   `expired`, `unverifiable`. Only `authenticated` is true.
+ */
+async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
     const filePath = getAuthFilePath(authFilePath);
-    
+
     if (!(await fs.pathExists(filePath))) {
-        return false;
+        return { authenticated: false, reason: 'no_auth_file', detail: `${filePath} does not exist` };
     }
 
-    let browser;
+    // An auth file that exists but is unusable is a definite "not authenticated",
+    // not an unknown: handing it to newContext() would throw, so there is
+    // nothing to be uncertain about.
+    const usable = await verifyAuthStateFile(filePath);
+    if (!usable.ok) {
+        return { authenticated: false, reason: 'unusable_auth_file', detail: usable.detail };
+    }
+
+    let browser = null;
     try {
         logger.debug('Verifying authentication session...');
         browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({ storageState: filePath });
         const page = await context.newPage();
 
-        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CHECK_NAV_TIMEOUT });
 
-        logger.info('Will wait 2 sec to allow client-side redirects to Microsoft login pages if session is dead/');
-        await page.waitForTimeout(2000);
+        // The old check waited a fixed 2 s and asked whether the URL happened to
+        // be a login host by then. That is a race with a timer, and it lost:
+        // Microsoft serves the app shell first and redirects a dead session to
+        // login.live.com several seconds later, so a completely empty auth file
+        // was read as "authenticated" and `check` exited 0. Measured on an auth
+        // file with zero cookies: the page was still on
+        // onenote.cloud.microsoft/ after the 2 s, and reported as signed in.
+        //
+        // The redirect is not even the signal — it is only how a dead session
+        // usually announces itself, and waiting for it is how the old code
+        // mistook "has not happened yet" for "will not happen". So both
+        // outcomes are waited on, and the first to arrive decides.
+        logger.info('Waiting for Microsoft to either open the app or send this session to a login page...');
+        await settleSessionProbe(page, targetUrl, CHECK_SETTLE_TIMEOUT);
 
         const url = page.url();
         const isLoginUrl = url.includes('login.live.com') || url.includes('login.microsoftonline.com');
@@ -1616,27 +1797,130 @@ async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
         if (isLoginUrl) {
             logger.warn('Authentication session has expired. Deleting stale auth state.');
             await logout(authFilePath);
-            return false;
+            return {
+                authenticated: false,
+                reason: 'expired',
+                detail: `the session was redirected to ${shortUrl(url)}; stale auth state deleted`
+            };
         }
 
-        return true;
+        // Neither side arrived. The session was never actually authenticated —
+        // it sat on the unauthenticated shell the whole time — and saying so is
+        // the whole point of the probe above.
+        return {
+            authenticated: false,
+            reason: 'expired',
+            detail: `the session stayed unauthenticated at ${shortUrl(url)}; it never reached a login page either`
+        };
     } catch (e) {
         logger.debug(`Session verification encountered an error (timeout/network): ${e.message}`);
-        return true;
+        return {
+            authenticated: false,
+            reason: 'unverifiable',
+            detail: `could not verify the session (${e.message}); the auth file was left in place`
+        };
     } finally {
-        logger.debug(`Looks like user is logged in.`);
+        // Was `logger.debug('Looks like user is logged in.')`, printed from a
+        // finally on every single run — including for an expired session that
+        // had just been deleted, and for a network failure. It asserted the
+        // opposite of the return value on two of the three paths.
         if (browser) {
-            await browser.close();
+            await browser.close().catch(() => { });
         }
     }
+}
+
+/**
+ * Waits for a loaded Microsoft page to reveal whether the session is real.
+ *
+ * Three things count as an answer, and whichever comes first wins:
+ *
+ *   - a login page: the session is dead, which is the case this whole function
+ *     exists to catch;
+ *   - the authenticated app's UI markers: the session is live;
+ *   - neither, before the timeout: also dead. The app shell renders for an
+ *     unauthenticated session and never navigates anywhere, so silence is
+ *     itself a verdict rather than a reason to keep waiting.
+ *
+ * The authenticated-app signals are the UI markers login() waits for, built by
+ * the same authSuccessMarkerAttempts(). A change to what counts as "signed in"
+ * therefore cannot pass login's tests while leaving `check` quietly disagreeing
+ * with it.
+ *
+ * Deliberately *not* waited for: a URL match, in either form.
+ *
+ *   - Polling `page.url()` is the race the old 2 s sleep lost — it mistook
+ *     "has not redirected yet" for "will not redirect".
+ *   - login()'s own app-path signal cannot be reused here at all: `check`
+ *     navigates to ONENOTE_URL, which is /notebooks, and ONENOTE_APP_PATH
+ *     matches /notebooks. Used here it would answer 'app' the instant the page
+ *     loaded, never look at anything else, and reintroduce the same false
+ *     positive one layer down.
+ *
+ * The markers cannot be fooled either way: they only render once a session is
+ * real.
+ *
+ * Errors are swallowed by design: a timeout or a navigation that interrupts a
+ * wait is not a failure here, it just means the other signal gets its turn.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} targetUrl
+ * @param {number} [timeoutMs]
+ * @returns {Promise<'login'|'app'|'idle'>} which one decided it
+ */
+async function settleSessionProbe(page, targetUrl, timeoutMs = CHECK_SETTLE_TIMEOUT) {
+    const isLoginUrl = url => /login\.(live|microsoftonline)\.com/i.test(url.hostname);
+    const attempts = authSuccessMarkerAttempts(page, targetUrl, timeoutMs)
+        .map(a => a.wait.then(() => 'app'));
+    attempts.push(
+        page.waitForURL(isLoginUrl, { timeout: timeoutMs }).then(() => 'login')
+    );
+
+    // Promise.any keeps waiting after the first rejection, so this only gives
+    // up once every signal has either answered or timed out.
+    return await Promise.any(attempts).catch(() => 'idle');
+}
+
+/**
+ * True when there is a saved session that might work.
+ *
+ * Unchanged contract, including the conservative `true` on a verification
+ * error: an existing caller uses this to decide whether to *keep* the auth
+ * file, and losing a valid session to a transient network error would be worse
+ * than proceeding with one that turns out to be dead. Use verifyAuth() when you
+ * need to distinguish the two — that is what the CLI does, because an exit code
+ * cannot be hedged.
+ *
+ * One thing did change, and it is a bug fix rather than a hedge: an auth file
+ * that is not a Playwright storage state is now reported as not authenticated.
+ * It previously fell into the network-error branch and read as `true`, on the
+ * grounds that it might be a good session. It cannot be — nothing can open a
+ * context from it.
+ *
+ * @param {string} [targetUrl]
+ * @param {string} [authFilePath]
+ * @returns {Promise<boolean>}
+ */
+async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
+    const status = await verifyAuth(targetUrl, authFilePath);
+    return status.authenticated || status.reason === 'unverifiable';
 }
 
 module.exports = {
     login,
     getAuthenticatedContext,
     checkAuth,
+    verifyAuth,
     getAuthMeta,
     logout,
+    // Exported for tests and for callers that need to assert on the reason a
+    // login failed, since login() reports a boolean and the details go to the log.
+    verifyAuthStateFile,
+    // Exported for tests: how `check` tells a live session from a dead one,
+    // with a caller-supplied timeout so the assertion does not pay the
+    // production wait. The old fixed 2 s sleep reported an empty auth file as
+    // authenticated; this is the assertion that says it does not any more.
+    settleSessionProbe,
     // Exported for tests: clears the consent/interrupt screens that Microsoft can
     // inject mid-login (e.g. the Terms of Use update at account.live.com/tou/accrue).
     clearBlockingScreens,
