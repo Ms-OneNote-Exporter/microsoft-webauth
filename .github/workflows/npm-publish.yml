@@ -7,13 +7,21 @@ on:
 
 permissions:
   id-token: write  # Required for OIDC trusted publishing
-  contents: read
+  # write, not read: the Release step below creates a Release, which is a
+  # contents write. At read this step fails with a permissions error and the
+  # repository accumulates tags with no Releases behind them.
+  contents: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The Release step reads its notes out of the tag object, which the
+          # default depth-1 fetch does not reliably carry. Fetching everything
+          # is cheap here: this job is already paying for a Chromium download.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -73,3 +81,27 @@ jobs:
           rm -f "$PACK_JSON"
 
       - run: npm publish --access public --provenance
+
+      # Publishing to npm and creating a Release are two different objects, and
+      # only the first one was automated here: nine tags reached the registry
+      # between v0.1.1 and v0.1.9 while the repository had a single Release,
+      # hand-made back at v0.0.9, so the sidebar's "Latest" badge pointed three
+      # months stale. Runs last, after the publish: a failed build must not
+      # leave a Release behind advertising a version that never shipped.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+          # The tag message is already the changelog; strip only the
+          # "commit <sha>" trailer that git appends to it.
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" | sed '/^commit /,$d' > "$NOTES"
+          # A re-run of this workflow must not fail on the Release it made the
+          # first time round.
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists, leaving it untouched"
+            exit 0
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "$NOTES"
