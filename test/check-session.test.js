@@ -14,6 +14,9 @@
  * @author phptr,enoola,msout
  * @copyright 2026 phptr,enoola,msout
  */
+const path = require('path');
+const os = require('os');
+const fs = require('fs-extra');
 const { chromium, describeWithBrowser } = require('./helpers/browser-suite');
 
 jest.mock('../src/utils/logger', () => ({
@@ -132,5 +135,98 @@ describeWithBrowser('settleSessionProbe — telling a live session from a dead o
         const started = Date.now();
         expect(await probe(ONENOTE_SHELL, {}, 1200)).toBe('idle');
         expect(Date.now() - started).toBeGreaterThanOrEqual(1000);
+    });
+});
+
+/**
+ * The probe above is only half of `check`, and the half that was wrong was not
+ * missing — it was ignored. verifyAuth() awaited settleSessionProbe() and threw
+ * the verdict away, then re-derived the answer from the URL on its own. Only a
+ * redirect to a login host could count as a positive result, so every live
+ * session was reported expired, on every run: a valid auth file that listed
+ * notebooks perfectly well could still only make `check` exit 1.
+ *
+ * The probe's own tests pass while that is true, which is why this asserts on
+ * the reported status instead. No real browser: the page resolves exactly the
+ * signals each verdict describes and times out instantly on the rest, so all
+ * three cases cost milliseconds rather than the production 30 s.
+ */
+describe('verifyAuth — the probe verdict is what gets reported', () => {
+    let dir;
+    let authFile;
+
+    beforeEach(() => {
+        jest.resetModules();
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webauth-verdict-'));
+        authFile = path.join(dir, 'auth-file.json');
+        fs.writeJsonSync(authFile, { cookies: [{ name: 'ESAuth', value: 'x' }], origins: [] });
+    });
+
+    afterEach(() => {
+        fs.rmSync(dir, { recursive: true, force: true });
+        jest.dontMock('playwright');
+        jest.resetModules();
+    });
+
+    /**
+     * A Playwright stand-in parked at `url`, where `marker` names the one
+     * signed-in selector that resolves and `login` decides whether the login-URL
+     * wait resolves. Anything else rejects at once, standing in for the
+     * timeout: the real waits would leave these tests taking a minute each.
+     */
+    const browserAt = (url, { marker, login } = {}) => {
+        const arrived = yes => yes ? Promise.resolve() : Promise.reject(new Error('Timeout'));
+        const page = {
+            goto: async () => { },
+            url: () => url,
+            waitForSelector: selector => arrived(!!marker && selector.includes(marker)),
+            waitForURL: () => arrived(!!login)
+        };
+        return {
+            newContext: async () => ({ newPage: async () => page }),
+            close: async () => { }
+        };
+    };
+
+    const verifyWith = browser => {
+        jest.doMock('playwright', () => ({ chromium: { launch: async () => browser } }));
+        return require('../src/auth').verifyAuth(ONENOTE_SHELL, authFile);
+    };
+
+    // The reported bug, as a passing session. It reaches the signed-in
+    // interface, so that is the answer — whatever the URL happens to say.
+    it('reports a session that reaches the signed-in interface as authenticated', async () => {
+        const status = await verifyWith(
+            browserAt('https://onenote.cloud.microsoft/notebooks/', { marker: 'My notebooks' })
+        );
+
+        expect(status.authenticated).toBe(true);
+        expect(status.reason).toBe('authenticated');
+        expect(fs.existsSync(authFile)).toBe(true);
+    });
+
+    it('reports a session sent to a login page as expired, and clears it', async () => {
+        const status = await verifyWith(
+            browserAt('https://login.live.com/common/oauth2/v2.0/authorize', { login: true })
+        );
+
+        expect(status.authenticated).toBe(false);
+        expect(status.reason).toBe('expired');
+        // The one verdict that earns a deletion: Microsoft itself sent the
+        // session to the login page.
+        expect(fs.existsSync(authFile)).toBe(false);
+    });
+
+    // Silence is not proof of a dead session. It is also what a live session
+    // gives when the app is slower than the wait — measured at ~10 s to render
+    // the notebook UI, against a 10 s budget — so nothing may be deleted here.
+    it('leaves the auth file alone when neither signal arrives', async () => {
+        const status = await verifyWith(browserAt('https://onenote.cloud.microsoft/notebooks/'));
+
+        expect(status.authenticated).toBe(false);
+        // Not 'expired': nothing proved the session dead, only that this run
+        // failed to see it, and the two deserve different advice.
+        expect(status.reason).toBe('stayed_unauthenticated');
+        expect(fs.existsSync(authFile)).toBe(true);
     });
 });
