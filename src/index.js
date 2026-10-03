@@ -6,9 +6,56 @@
  */
 const { program } = require('commander');
 const logger = require('./utils/logger');
-const { login, checkAuth, getAuthMeta, logout } = require('./auth');
+const { login, getAuthMeta, verifyAuth, logout } = require('./auth');
 const { DEFAULT_AUTH_FILE, ONENOTE_URL, OUTLOOK_URL } = require('./config');
 const { version: PKG_VERSION } = require('../package.json');
+
+/**
+ * Process exit codes.
+ *
+ * 0 and 1, and nothing else. A login either produced usable state or it did
+ * not, and a script driving this CLI needs to be able to branch on that with
+ * `if ! microsoft-webauth login ...`. Enumerating distinct failures (bad
+ * credentials, timeout, network) would be more informative, but it would make
+ * the *success* case the only value a caller must not hardcode, and the failure
+ * case is the one people end up hardcoding. The reason is already in the log
+ * and in the message on stderr.
+ */
+const EXIT_SUCCESS = 0;
+const EXIT_FAILURE = 1;
+
+/**
+ * Runs a command's work and records the exit code.
+ *
+ * `work` returns a boolean and does its own reporting, so the reporting stays in
+ * one place with the logic that produced it.
+ *
+ * `process.exitCode` is assigned rather than `process.exit()` called, because
+ * the latter cuts the process off mid-flight: stdout is a pipe here often
+ * enough — that is the entire use case — and a truncated last line is a mangled
+ * error message. Assigning it lets Node finish writing and exit on its own,
+ * while still producing exactly the code a caller checks.
+ */
+async function run(work) {
+    let ok;
+    try {
+        ok = await work();
+    } catch (e) {
+        // Every command reports its own failure through its return value. This
+        // is the backstop for anything that escapes — an unwritable auth file,
+        // a full disk — so a crash is a non-zero exit rather than yet another
+        // silent success.
+        logger.error(e && e.message ? e.message : String(e), e instanceof Error ? e : null);
+        ok = false;
+    }
+    process.exitCode = ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    return ok;
+}
+
+/** One line saying why a command failed, on stderr. */
+function reportFailure(command, hint) {
+    logger.error(`${command} failed (exit ${EXIT_FAILURE}). ${hint}`);
+}
 
 program
     .name('webauth')
@@ -34,7 +81,18 @@ program
             options.dodump = true;
         }
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
-        await login({ ...options, targetUrl });
+
+        // login() resolves a boolean rather than throwing: it covers both halves
+        // of "logged in" — the session authenticated, and the auth file was
+        // written and read back — and it is also this package's main export, so
+        // throwing would break existing library callers.
+        await run(async () => {
+            const ok = await login({ ...options, targetUrl });
+            if (!ok) {
+                reportFailure('login', 'No usable auth state was saved. See the errors above.');
+            }
+            return ok;
+        });
     });
 
 program
@@ -44,8 +102,25 @@ program
     .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
-        const isAuth = await checkAuth(targetUrl, options.authFile);
-        if (isAuth) {
+        await run(async () => {
+            // verifyAuth() rather than checkAuth(): checkAuth answers "is there a
+            // session worth keeping", where a failed check counts as yes, and
+            // that conservative default is exactly what must not leak into an
+            // exit code. An unverifiable session exits 1 — the honest answer to
+            // "am I logged in?" is no — while the auth file is left untouched,
+            // since a check that failed is not evidence the session is bad.
+            const status = await verifyAuth(targetUrl, options.authFile);
+            logger.debug(`Check result: ${status.reason} — ${status.detail}`);
+
+            if (!status.authenticated) {
+                logger.error(`Not authenticated (${status.reason}). ${status.detail}`);
+                if (status.reason === 'no_auth_file' || status.reason === 'expired') {
+                    logger.error('Run "login" first.');
+                }
+                reportFailure('check', 'No authenticated session could be confirmed. See the reason above.');
+                return false;
+            }
+
             logger.success('Authentication file found. You are authenticated.');
             const meta = await getAuthMeta(options.authFile);
             if (meta && meta.email) {
@@ -53,9 +128,8 @@ program
                 logger.info(`Logged in as: ${meta.email}`);
                 logger.debug(`Session started at: ${loginTime}`);
             }
-        } else {
-            logger.error('Authentication file NOT found or invalid. Run "login" first.');
-        }
+            return true;
+        });
     });
 
 program
@@ -63,8 +137,14 @@ program
     .description('Clear authentication state')
     .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
+        // Not routed through run(): there is nothing here that can report a
+        // failure. logout() removes both files unconditionally and never
+        // throws, so this command has exactly one outcome and it is the
+        // successful one — exiting 0 for "there was nothing to delete" included,
+        // which is the answer a caller wants.
         await logout(options.authFile);
         logger.success('Logged out successfully. Authentication state cleared.');
+        process.exitCode = EXIT_SUCCESS;
     });
 
 program.parse();

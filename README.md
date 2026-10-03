@@ -119,6 +119,34 @@ With custom auth file path:
 microsoft-webauth logout --auth-file /path/to/authfile.json
 ```
 
+## Exit codes
+
+`login` and `check` exit `0` only when they actually succeeded, so a shell script
+or a CI step can branch on them:
+
+```bash
+microsoft-webauth login --email you@example.com --password ... \
+  && microsoft-webauth export   # only runs if the login worked
+```
+
+| Command | Exit 0 | Exit 1 |
+|---------|--------|--------|
+| `login` | the session authenticated **and** the auth file was written and read back | the login failed, or it reached the app but the auth file is missing, unparseable or not a Playwright storage state |
+| `check` | the saved session was confirmed live | no auth file, the session has expired, or it could not be verified |
+| `logout` | always | — |
+
+Two details worth knowing:
+
+- A login that reaches the authenticated app but leaves nothing usable on disk
+  exits `1`. The auth file is written and then read back, because a write that
+  returned without throwing is not evidence that a file exists.
+- `check` exits `1` when it cannot confirm a session — including when the check
+  itself failed on a network error. The auth file is still left in place in that
+  case: the check failing is not evidence that the session is bad. This is why
+  `check` waits for Microsoft to either open the app or redirect to a login page,
+  rather than deciding after a fixed pause, and why a session that stays on the
+  unauthenticated page is reported as expired instead of working.
+
 ## Options
 
 | Option | Description |
