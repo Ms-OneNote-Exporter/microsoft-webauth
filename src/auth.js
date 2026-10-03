@@ -174,9 +174,17 @@ const AUTH_SUCCESS_TIMEOUT = 60000;
  * export a notebook, so a few seconds of certainty is cheap next to a wrong
  * answer; and it only ever waits this long when the session is already broken.
  * A live session resolves on the first signal, usually in well under a second.
+ *
+ * Was 10 s, which was a coin flip rather than a budget: measured against a
+ * working auth file, the signed-in UI ("My notebooks", "All Notebooks") rendered
+ * 9.7 s after `domcontentloaded` — a 0.3 s margin on a warm run, and nothing at
+ * all on a cold one. `check` therefore reported a perfectly good session as
+ * expired on any day the network or the SPA's cache was slower than usual.
+ * 30 s clears the measured case with room to spare, and it is only ever paid in
+ * full by a session that is already broken.
  */
 const CHECK_NAV_TIMEOUT = 15000;
-const CHECK_SETTLE_TIMEOUT = 10000;
+const CHECK_SETTLE_TIMEOUT = 30000;
 
 /** Outlook and OneNote are recognised differently, so the target picks the set. */
 const isOutlookTarget = targetUrl => !!targetUrl && targetUrl.includes('outlook.cloud.microsoft');
@@ -1750,7 +1758,9 @@ async function getAuthenticatedContext(browser, authFilePath) {
  * @param {string} [authFilePath]
  * @returns {Promise<{ authenticated: boolean, reason: string, detail: string }>}
  *   `reason` is one of `authenticated`, `no_auth_file`, `unusable_auth_file`,
- *   `expired`, `unverifiable`. Only `authenticated` is true.
+ *   `expired`, `stayed_unauthenticated`, `unverifiable`. Only `authenticated`
+ *   is true. Only `expired` deletes the auth file, because only it is
+ *   Microsoft's own word that the session is gone.
  */
 async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
     const filePath = getAuthFilePath(authFilePath);
@@ -1789,28 +1799,50 @@ async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
         // mistook "has not happened yet" for "will not happen". So both
         // outcomes are waited on, and the first to arrive decides.
         logger.info('Waiting for Microsoft to either open the app or send this session to a login page...');
-        await settleSessionProbe(page, targetUrl, CHECK_SETTLE_TIMEOUT);
+        const verdict = await settleSessionProbe(page, targetUrl, CHECK_SETTLE_TIMEOUT);
+        const where = shortUrl(page.url());
 
-        const url = page.url();
-        const isLoginUrl = url.includes('login.live.com') || url.includes('login.microsoftonline.com');
+        // The verdict decides, and nothing else does.
+        //
+        // It used not to: settleSessionProbe's answer was awaited and dropped on
+        // the floor, after which the code went on to re-derive the answer from
+        // the URL alone. Since only a redirect to a login host could then count
+        // as a positive result, every live session was reported as expired —
+        // deterministically, not intermittently — and `check` could only ever
+        // exit 1. The probe was built to be the answer; asking it and then
+        // ignoring it was the bug.
+        if (verdict === 'app') {
+            return {
+                authenticated: true,
+                reason: 'authenticated',
+                detail: `the signed-in interface rendered at ${where}`
+            };
+        }
 
-        if (isLoginUrl) {
+        // Only a login redirect is allowed to delete anything. It is Microsoft
+        // stating that the session is dead. The silent case below is the absence
+        // of evidence, and a live session produces it too whenever the app is
+        // slower than the timeout — deleting there would throw away a working
+        // login over a timeout, which is the destructive half of the bug above.
+        if (verdict === 'login') {
             logger.warn('Authentication session has expired. Deleting stale auth state.');
             await logout(authFilePath);
             return {
                 authenticated: false,
                 reason: 'expired',
-                detail: `the session was redirected to ${shortUrl(url)}; stale auth state deleted`
+                detail: `the session was redirected to ${where}; stale auth state deleted`
             };
         }
 
         // Neither side arrived. The session was never actually authenticated —
         // it sat on the unauthenticated shell the whole time — and saying so is
-        // the whole point of the probe above.
+        // the whole point of the probe above. Deliberately not `expired`: no
+        // redirect means nothing proved the session dead, only that this run
+        // failed to see it, and the auth file is left in place for the retry.
         return {
             authenticated: false,
-            reason: 'expired',
-            detail: `the session stayed unauthenticated at ${shortUrl(url)}; it never reached a login page either`
+            reason: 'stayed_unauthenticated',
+            detail: `the signed-in interface never rendered at ${where} and the session was never sent to a login page; the auth file was left in place`
         };
     } catch (e) {
         logger.debug(`Session verification encountered an error (timeout/network): ${e.message}`);

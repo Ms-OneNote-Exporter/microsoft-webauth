@@ -114,9 +114,10 @@ program
 
             if (!status.authenticated) {
                 logger.error(`Not authenticated (${status.reason}). ${status.detail}`);
-                if (status.reason === 'no_auth_file' || status.reason === 'expired') {
-                    logger.error('Run "login" first.');
-                }
+                // Every reason here is fixed by logging in again, including the
+                // one that only failed to see a live session: the honest advice
+                // for "check could not confirm it" is still to log in.
+                logger.error('Run "login" first.');
                 reportFailure('check', 'No authenticated session could be confirmed. See the reason above.');
                 return false;
             }
