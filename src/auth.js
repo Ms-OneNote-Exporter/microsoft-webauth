@@ -1737,6 +1737,54 @@ async function getAuthenticatedContext(browser, authFilePath) {
 }
 
 /**
+ * Writes one of `check`'s page states, when dumps were asked for.
+ *
+ * A dump is a debugging aid and may not become a verdict. Two things could make
+ * it one, and both are handled here rather than at the three call sites:
+ *
+ *   - The write can fail on its own terms — an unwritable dump directory, a full
+ *     disk. dumpPage() throws there, and the caller is inside verifyAuth()'s
+ *     try block, so an unwritable dump directory would be caught as a
+ *     verification error and turn a live session into `unverifiable`. A debug
+ *     flag must not be able to change the answer it exists to explain.
+ *   - There may be no page at all: the browser can fail to launch, and the
+ *     error-path dump has to survive that.
+ *
+ * @param {import('playwright').Page|null} page
+ * @param {string} fileName  basename, e.g. debug_check_login.html
+ * @param {object} options
+ * @param {boolean} options.dodump
+ * @param {boolean} options.screenshot
+ */
+async function dumpCheckPage(page, fileName, { dodump, screenshot }) {
+    if (!dodump) return;
+    if (!page) {
+        logger.debug(`[dodump] No page to dump for ${fileName} — the browser never got one.`);
+        return;
+    }
+    try {
+        const displayPath = await dumpPage(page, fileName, { screenshot });
+        logger.debug(`[dodump] Check state dumped to ${displayPath}/${fileName}`);
+    } catch (e) {
+        logger.warn(`[dodump] Could not write ${fileName}: ${e.message} (the check itself is unaffected)`);
+    }
+}
+
+/**
+ * Says why `--dodump` produced nothing, on the paths that never load a page.
+ *
+ * Two of the six verdicts are decided before a browser exists, so a user who
+ * asked for dumps and got none would otherwise have no way to tell that from a
+ * broken dump directory — the two need completely different investigations.
+ *
+ * @param {boolean} dodump
+ * @param {string} why
+ */
+function noteNothingToDump(dodump, why) {
+    if (dodump) logger.info(`[dodump] Nothing to dump: ${why}.`);
+}
+
+/**
  * Checks the saved session and says which of the three possible answers it got.
  *
  * A boolean cannot carry this. "Not logged in" and "could not tell" are very
@@ -1754,18 +1802,48 @@ async function getAuthenticatedContext(browser, authFilePath) {
  * `unverifiable` deliberately does not touch the auth file: the state on disk
  * may be perfectly good, and the only thing that failed was the check.
  *
- * @param {string} [targetUrl] ONENOTE_URL or OUTLOOK_URL
- * @param {string} [authFilePath]
+ * The arguments are one object rather than two positionals so that the debug
+ * flags ride along with the rest instead of needing a signature that grows a
+ * parameter per flag — the same shape login() takes its credentials in.
+ *
+ * @param {object} [options]
+ * @param {string} [options.targetUrl] ONENOTE_URL or OUTLOOK_URL
+ * @param {string} [options.authFilePath]
+ * @param {boolean} [options.dodump] write the pages this check looked at, so a
+ *   surprising verdict can be read rather than guessed at
+ * @param {boolean} [options.screenshot] also write a PNG beside each dump
  * @returns {Promise<{ authenticated: boolean, reason: string, detail: string }>}
  *   `reason` is one of `authenticated`, `no_auth_file`, `unusable_auth_file`,
  *   `expired`, `stayed_unauthenticated`, `unverifiable`. Only `authenticated`
  *   is true. Only `expired` deletes the auth file, because only it is
  *   Microsoft's own word that the session is gone.
+ * @throws {TypeError} if called with the positional arguments it used to take
  */
-async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
+async function verifyAuth(options = {}, legacyAuthFilePath) {
+    // The positional form used to be verifyAuth(targetUrl, authFilePath), and a
+    // caller upgrading this package would have no other way to find out: the
+    // string would destructure to an undefined targetUrl and the check would
+    // quietly run against OneNote and the default auth file, reporting a real
+    // answer to a question about a different session. A loud TypeError is worth
+    // more here than a plausible wrong result.
+    if (typeof options === 'string' || legacyAuthFilePath !== undefined) {
+        throw new TypeError(
+            'verifyAuth() takes a single options object: verifyAuth({ targetUrl, authFilePath, dodump, screenshot }). ' +
+            'The positional verifyAuth(targetUrl, authFilePath) form is no longer supported; ' +
+            'checkAuth(targetUrl, authFilePath) still takes positionals.'
+        );
+    }
+
+    const {
+        targetUrl = ONENOTE_URL,
+        authFilePath,
+        dodump = false,
+        screenshot = false
+    } = options;
     const filePath = getAuthFilePath(authFilePath);
 
     if (!(await fs.pathExists(filePath))) {
+        noteNothingToDump(dodump, 'there is no auth file to check');
         return { authenticated: false, reason: 'no_auth_file', detail: `${filePath} does not exist` };
     }
 
@@ -1774,17 +1852,25 @@ async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
     // nothing to be uncertain about.
     const usable = await verifyAuthStateFile(filePath);
     if (!usable.ok) {
+        noteNothingToDump(dodump, `the auth file is unusable (${usable.reason}), so no page was ever loaded`);
         return { authenticated: false, reason: 'unusable_auth_file', detail: usable.detail };
     }
 
     let browser = null;
+    let page = null;
     try {
         logger.debug('Verifying authentication session...');
         browser = await chromium.launch({ headless: true });
         const context = await browser.newContext({ storageState: filePath });
-        const page = await context.newPage();
+        page = await context.newPage();
 
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: CHECK_NAV_TIMEOUT });
+
+        // Before the probe gets to change anything. On an expired session this is
+        // the last thing that is still the app shell, which is the half of the
+        // story that the verdict dump below cannot tell: by the time the probe
+        // answers, the shell has already been replaced by the login page.
+        await dumpCheckPage(page, 'debug_check_after_nav.html', { dodump, screenshot });
 
         // The old check waited a fixed 2 s and asked whether the URL happened to
         // be a login host by then. That is a race with a timer, and it lost:
@@ -1801,6 +1887,13 @@ async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
         logger.info('Waiting for Microsoft to either open the app or send this session to a login page...');
         const verdict = await settleSessionProbe(page, targetUrl, CHECK_SETTLE_TIMEOUT);
         const where = shortUrl(page.url());
+
+        // The page that decided the answer, named for the verdict so the file
+        // says which of the three it is without having to be opened — and so
+        // that three different failures cannot overwrite one another's
+        // evidence in the same minute, the way a single `debug_check.html`
+        // would.
+        await dumpCheckPage(page, `debug_check_${verdict}.html`, { dodump, screenshot });
 
         // The verdict decides, and nothing else does.
         //
@@ -1846,6 +1939,13 @@ async function verifyAuth(targetUrl = ONENOTE_URL, authFilePath) {
         };
     } catch (e) {
         logger.debug(`Session verification encountered an error (timeout/network): ${e.message}`);
+        // The one case where a dump is the only evidence there is: the exception
+        // carries a message and nothing about the page that produced it. A
+        // navigation timeout, a proxy interception page or a TLS failure all land
+        // here, and all look identical in the log. `page` may be null if the
+        // browser never launched, which is why this goes through the same
+        // null-tolerant helper rather than dumpPage() directly.
+        await dumpCheckPage(page, 'debug_check_error.html', { dodump, screenshot });
         return {
             authenticated: false,
             reason: 'unverifiable',
@@ -1934,7 +2034,10 @@ async function settleSessionProbe(page, targetUrl, timeoutMs = CHECK_SETTLE_TIME
  * @returns {Promise<boolean>}
  */
 async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
-    const status = await verifyAuth(targetUrl, authFilePath);
+    // Still positional, on purpose: this function's contract is documented as
+    // unchanged for the library callers that depend on it, and the CLI — the
+    // only surface that exposes the dump flags — calls verifyAuth() directly.
+    const status = await verifyAuth({ targetUrl, authFilePath });
     return status.authenticated || status.reason === 'unverifiable';
 }
 

@@ -236,6 +236,46 @@ describe('CLI exit code wiring', () => {
         const code = await runCli(['logout', '--auth-file', '/tmp/x.json']);
         expect(code).toBe(0);
     });
+
+    // The dump flags are only useful if they survive the trip through the
+    // command line: commander hands them over as booleans, and a `--dodump`
+    // that reached verifyAuth as undefined would be a flag that silently does
+    // nothing, which is the exact failure the pair is documented to prevent.
+    it('check passes --dodump and --screenshot down to verifyAuth', async () => {
+        await runCli(['check', '--dodump', '--screenshot', '--auth-file', '/tmp/x.json']);
+
+        expect(authMock.verifyAuth).toHaveBeenCalledWith(expect.objectContaining({
+            authFilePath: '/tmp/x.json',
+            dodump: true,
+            screenshot: true
+        }));
+    });
+
+    // Same rule as login's: a screenshot of a page that was never dumped is
+    // not a screenshot, so the one flag turns on the other.
+    it('check turns on --dodump when only --screenshot is given', async () => {
+        await runCli(['check', '--screenshot', '--auth-file', '/tmp/x.json']);
+
+        expect(authMock.verifyAuth).toHaveBeenCalledWith(
+            expect.objectContaining({ dodump: true, screenshot: true })
+        );
+        // runCli() resets the module registry, so the logger index.js warned
+        // through has to be asked for again — a reference captured at file scope
+        // would be a different mock object and would record nothing.
+        expect(require('../src/utils/logger').warn).toHaveBeenCalledWith(
+            expect.stringContaining('--dodump')
+        );
+    });
+
+    // And a plain `check` — the one that runs unattended in CI — must not start
+    // writing dumps.
+    it('check passes the dump flags as false when neither is given', async () => {
+        await runCli(['check', '--auth-file', '/tmp/x.json']);
+
+        expect(authMock.verifyAuth).toHaveBeenCalledWith(
+            expect.objectContaining({ dodump: false, screenshot: false })
+        );
+    });
 });
 
 describe('the shipped binary, end to end', () => {

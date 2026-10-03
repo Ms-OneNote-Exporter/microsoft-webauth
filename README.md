@@ -107,6 +107,13 @@ With custom auth file path:
 microsoft-webauth check --auth-file /path/to/authfile.json
 ```
 
+To find out *why* it says what it says, capture the pages it looked at — see
+[Debug dumps and screenshots](#debug-dumps-and-screenshots):
+
+```bash
+microsoft-webauth check --dodump --screenshot
+```
+
 ### Logout
 
 ```bash
@@ -154,14 +161,18 @@ Two details worth knowing:
 | `--email <email>` | Microsoft account email (for automated login) |
 | `--password <password>` | Microsoft account password (for automated login) |
 | `--notheadless` | Run in visible browser mode (disable headless) |
-| `--dodump` | Dump HTML content to files for debugging |
+| `--dodump` | Dump HTML content to files for debugging (`login` and `check`) |
 | `--screenshot` | With `--dodump`, also save a PNG screenshot of each dumped page |
 | `--auth-file <path>` | Path to auth file (default: ~/.microsoft-webauth/auth-file.json) |
+
+`--screenshot` on its own turns `--dodump` on as well, and says so: a screenshot
+of a page that was never dumped is not a screenshot.
 
 ## Debug dumps and screenshots
 
 ```bash
 microsoft-webauth login --email you@example.com --password ... --dodump --screenshot
+microsoft-webauth check --dodump --screenshot
 ```
 
 With `--dodump`, every screen state captured during an automated login is
@@ -170,6 +181,27 @@ after the password, on each interstitial screen, and on the failure paths.
 Adding `--screenshot` saves a full-page PNG of the same screen under the same
 basename, so `debug_after_email.html` is accompanied by
 `debug_after_email.png`.
+
+`check` dumps too, and it is the command that most needs it: it answers in one
+line (`expired`, `stayed_unauthenticated`, `unverifiable`) where a dozen
+different causes live. `--dodump` writes the pages it actually looked at:
+
+| File | What it is |
+|------|------------|
+| `debug_check_after_nav.html` | the page as loaded, before the session probe gets to change anything |
+| `debug_check_app.html` | the signed-in interface — the `authenticated` verdict |
+| `debug_check_login.html` | the login page — the `expired` verdict, and the auth file was deleted |
+| `debug_check_idle.html` | neither arrived — `stayed_unauthenticated` |
+| `debug_check_error.html` | the navigation itself failed — `unverifiable` |
+
+Each verdict gets its own file on purpose: the dump directory is per-minute, and
+`check` is the command people re-run, so one shared `debug_check.html` would let
+a run that reported `expired` be overwritten by a later one. A screenshot of
+each of these is written alongside it under the same basename.
+
+Two verdicts — `no_auth_file` and `unusable_auth_file` — are decided before a
+browser exists, so there is no page to dump; `--dodump` says so on those rather
+than leaving you to work out whether the dump directory is broken.
 
 Interstitial screens are captured wherever they turn up, including the ones that
 arrive *late* — Microsoft often serves them 20–60 s into a login, behind a "Stay
