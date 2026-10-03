@@ -261,11 +261,12 @@ describe('dumpPage --screenshot: capture options and failure handling', () => {
 describe('every --dodump write site takes a screenshot', () => {
     /**
      * Screenshots are taken inside dumpPage(), but only for the callers that ask
-     * for them, and the eight call sites in login(), clearBlockingScreens() and
-     * reachPasswordScreen() are the ones that know a dump is happening. One of
-     * them forgetting to pass the flag on would silently drop a screenshot from
-     * exactly one dump — the sort of gap that is only noticed while debugging
-     * the dump that is missing it.
+     * for them, and the nine call sites — eight in login(),
+     * clearBlockingScreens() and reachPasswordScreen(), plus the one in
+     * dumpCheckPage() behind `check --dodump` — are the ones that know a dump is
+     * happening. One of them forgetting to pass the flag on would silently drop
+     * a screenshot from exactly one dump — the sort of gap that is only noticed
+     * while debugging the dump that is missing it.
      */
     it('passes { screenshot } at every dumpPage() call in src/auth.js', () => {
         const source = fs.readFileSync(
@@ -273,8 +274,10 @@ describe('every --dodump write site takes a screenshot', () => {
 
         const calls = source.match(/await dumpPage\([\s\S]*?\);/g) || [];
 
-        // A regex that quietly matched nothing would pass this test for ever.
-        expect(calls.length).toBeGreaterThanOrEqual(8);
+        // A regex that quietly matched nothing would pass this test for ever, and
+        // so would deleting a whole call site — hence the exact count, raised
+        // when `check` gained its own.
+        expect(calls.length).toBe(9);
         expect(calls.filter(call => !call.includes('screenshot'))).toEqual([]);
     });
 });

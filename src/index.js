@@ -57,6 +57,24 @@ function reportFailure(command, hint) {
     logger.error(`${command} failed (exit ${EXIT_FAILURE}). ${hint}`);
 }
 
+/**
+ * Turns --screenshot on its own into a dump as well.
+ *
+ * Screenshots are only ever taken of a dumped page, so on their own they would
+ * be an option that silently does nothing — the kind of flag a user debugs for
+ * an hour. Both `login` and `check` accept the pair and mean the same thing by
+ * it, so the rule lives here rather than being restated per command and left to
+ * drift.
+ *
+ * @param {object} options  a commander's parsed options object, mutated in place
+ */
+function applyDumpFlags(options) {
+    if (options.screenshot && !options.dodump) {
+        logger.warn('--screenshot only applies to the pages written by --dodump; enabling --dodump as well.');
+        options.dodump = true;
+    }
+}
+
 program
     .name('webauth')
     .description('Microsoft web authentication via Playwright — extracted from MSOneNote Exporter')
@@ -73,13 +91,7 @@ program
     .option('--against <target>', 'Target service: onenote (default) or outlook', 'onenote')
     .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
-        // Screenshots are only ever taken of a dumped page, so on their own they
-        // would be an option that silently does nothing — the kind of flag a
-        // user debugs for an hour. It turns the dump on instead, and says so.
-        if (options.screenshot && !options.dodump) {
-            logger.warn('--screenshot only applies to the pages written by --dodump; enabling --dodump as well.');
-            options.dodump = true;
-        }
+        applyDumpFlags(options);
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
 
         // login() resolves a boolean rather than throwing: it covers both halves
@@ -98,9 +110,12 @@ program
 program
     .command('check')
     .description('Check if authenticated')
+    .option('--dodump', 'Dump HTML content to files for debugging')
+    .option('--screenshot', 'With --dodump, also save a PNG screenshot of each dumped page')
     .option('--against <target>', 'Target service: onenote (default) or outlook', 'onenote')
     .option('--auth-file <path>', 'Path to auth file (default: ~/.microsoft-webauth/auth-file.json)', DEFAULT_AUTH_FILE)
     .action(async (options) => {
+        applyDumpFlags(options);
         const targetUrl = options.against === 'outlook' ? OUTLOOK_URL : ONENOTE_URL;
         await run(async () => {
             // verifyAuth() rather than checkAuth(): checkAuth answers "is there a
@@ -109,7 +124,12 @@ program
             // exit code. An unverifiable session exits 1 — the honest answer to
             // "am I logged in?" is no — while the auth file is left untouched,
             // since a check that failed is not evidence the session is bad.
-            const status = await verifyAuth(targetUrl, options.authFile);
+            const status = await verifyAuth({
+                targetUrl,
+                authFilePath: options.authFile,
+                dodump: !!options.dodump,
+                screenshot: !!options.screenshot
+            });
             logger.debug(`Check result: ${status.reason} — ${status.detail}`);
 
             if (!status.authenticated) {

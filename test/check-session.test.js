@@ -17,18 +17,28 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs-extra');
+const logger = require('../src/utils/logger');
 const { chromium, describeWithBrowser } = require('./helpers/browser-suite');
 
-jest.mock('../src/utils/logger', () => ({
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-    success: jest.fn(),
-    debug: jest.fn(),
-    step: jest.fn(),
-    getDumpDir: async () => '/tmp/dumps',
-    getDumpDisplayPath: () => 'logs/dumps/test'
-}));
+jest.mock('../src/utils/logger', () => {
+    // Required inside the factory: jest.mock factories may not close over
+    // out-of-scope variables, so the shared dump dir has to be built here. A
+    // per-file temp dir rather than a fixed path, because the --dodump tests
+    // below assert on real files and jest runs test files in parallel workers.
+    const nodeFs = require('fs');
+    const nodePath = require('path');
+    const dir = nodeFs.mkdtempSync(nodePath.join(require('os').tmpdir(), 'check-dump-'));
+    return {
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn(),
+        success: jest.fn(),
+        debug: jest.fn(),
+        step: jest.fn(),
+        getDumpDir: jest.fn(async () => dir),
+        getDumpDisplayPath: () => 'logs/dumps/test'
+    };
+});
 
 const { settleSessionProbe } = require('../src/auth');
 
@@ -151,6 +161,32 @@ describeWithBrowser('settleSessionProbe — telling a live session from a dead o
  * signals each verdict describes and times out instantly on the rest, so all
  * three cases cost milliseconds rather than the production 30 s.
  */
+/**
+ * A Playwright stand-in parked at `url`, where `marker` names the one signed-in
+ * selector that resolves and `login` decides whether the login-URL wait
+ * resolves. Anything else rejects at once, standing in for the timeout: the real
+ * waits would leave these tests taking a minute each.
+ *
+ * `evaluate` and `screenshot` are here for the --dodump suite below, which goes
+ * through the real dumpPage(): evaluate stands in for the redacting read of the
+ * document, screenshot for the PNG written beside it.
+ */
+const browserAt = (url, { marker, login } = {}) => {
+    const arrived = yes => yes ? Promise.resolve() : Promise.reject(new Error('Timeout'));
+    const page = {
+        goto: async () => { },
+        url: () => url,
+        waitForSelector: selector => arrived(!!marker && selector.includes(marker)),
+        waitForURL: () => arrived(!!login),
+        evaluate: async () => `<!DOCTYPE html><html><body>stub page at ${url}</body></html>`,
+        screenshot: async ({ path: pngPath }) => fs.writeFileSync(pngPath, Buffer.alloc(8))
+    };
+    return {
+        newContext: async () => ({ newPage: async () => page }),
+        close: async () => { }
+    };
+};
+
 describe('verifyAuth — the probe verdict is what gets reported', () => {
     let dir;
     let authFile;
@@ -168,29 +204,13 @@ describe('verifyAuth — the probe verdict is what gets reported', () => {
         jest.resetModules();
     });
 
-    /**
-     * A Playwright stand-in parked at `url`, where `marker` names the one
-     * signed-in selector that resolves and `login` decides whether the login-URL
-     * wait resolves. Anything else rejects at once, standing in for the
-     * timeout: the real waits would leave these tests taking a minute each.
-     */
-    const browserAt = (url, { marker, login } = {}) => {
-        const arrived = yes => yes ? Promise.resolve() : Promise.reject(new Error('Timeout'));
-        const page = {
-            goto: async () => { },
-            url: () => url,
-            waitForSelector: selector => arrived(!!marker && selector.includes(marker)),
-            waitForURL: () => arrived(!!login)
-        };
-        return {
-            newContext: async () => ({ newPage: async () => page }),
-            close: async () => { }
-        };
-    };
-
-    const verifyWith = browser => {
+    const verifyWith = (browser, options = {}) => {
         jest.doMock('playwright', () => ({ chromium: { launch: async () => browser } }));
-        return require('../src/auth').verifyAuth(ONENOTE_SHELL, authFile);
+        return require('../src/auth').verifyAuth({
+            targetUrl: ONENOTE_SHELL,
+            authFilePath: authFile,
+            ...options
+        });
     };
 
     // The reported bug, as a passing session. It reaches the signed-in
@@ -228,5 +248,197 @@ describe('verifyAuth — the probe verdict is what gets reported', () => {
         // failed to see it, and the two deserve different advice.
         expect(status.reason).toBe('stayed_unauthenticated');
         expect(fs.existsSync(authFile)).toBe(true);
+    });
+});
+
+/**
+ * `--dodump` on `check`, which exists for the case the verdict cannot explain.
+ *
+ * "check said expired" is a single line and any number of causes: a dead
+ * session, a login page served for an unrelated reason, a captive portal, an
+ * app shell that never finished rendering. The verdict names which of those it
+ * thinks it saw; the dump is what lets a person confirm it. So the pages that
+ * decide the answer have to be on disk, at every stage of the run.
+ *
+ * No real browser: the stub above answers exactly the signals each verdict
+ * describes, and the real dumpPage() runs for real against a temp dir, so the
+ * files asserted on here are the ones production writes.
+ */
+describe('check --dodump', () => {
+    let dir;
+    let authFile;
+    let dumpDir;
+
+    /**
+     * The logger of the *current* module registry.
+     *
+     * jest.resetModules() in beforeEach re-runs the mock factory, so auth.js and
+     * this test share an instance only if both ask for it after the reset —
+     * a reference captured at file scope would be a different object, with a
+     * different dump directory, from the one dumpPage() writes through.
+     */
+    const currentLogger = () => require('../src/utils/logger');
+
+    const verifyWith = (browser, options = {}) => {
+        jest.doMock('playwright', () => ({ chromium: { launch: async () => browser } }));
+        return require('../src/auth').verifyAuth({
+            targetUrl: ONENOTE_SHELL,
+            authFilePath: authFile,
+            ...options
+        });
+    };
+
+    const APP_BROWSER = () => browserAt('https://onenote.cloud.microsoft/notebooks/', { marker: 'All Notebooks' });
+
+    /**
+     * One stub whose verdict follows `state`, so a single test can produce all
+     * three — and therefore write all three into one dump directory, which is
+     * the only way to show that they do not overwrite each other.
+     *
+     * A per-call stub would not do: src/auth.js captures chromium when it is
+     * first required, so every later call in the same test would keep getting
+     * whichever browser was set up first.
+     */
+    const browserFollowing = state => {
+        const arrived = yes => yes ? Promise.resolve() : Promise.reject(new Error('Timeout'));
+        const page = {
+            goto: async () => { },
+            url: () => state.url,
+            waitForSelector: selector => arrived(!!state.marker && selector.includes(state.marker)),
+            waitForURL: () => arrived(!!state.login),
+            evaluate: async () => '<!DOCTYPE html><html><body>stub</body></html>',
+            screenshot: async ({ path: pngPath }) => fs.writeFileSync(pngPath, Buffer.alloc(8))
+        };
+        return {
+            newContext: async () => ({ newPage: async () => page }),
+            close: async () => { }
+        };
+    };
+
+    const written = name => fs.existsSync(path.join(dumpDir, name));
+
+    beforeEach(async () => {
+        jest.resetModules();
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webauth-check-dump-'));
+        authFile = path.join(dir, 'auth-file.json');
+        fs.writeJsonSync(authFile, { cookies: [{ name: 'ESAuth', value: 'x' }], origins: [] });
+        dumpDir = await currentLogger().getDumpDir();
+    });
+
+    afterEach(() => {
+        fs.rmSync(dir, { recursive: true, force: true });
+        jest.dontMock('playwright');
+        jest.resetModules();
+    });
+
+    it('writes the page it navigated to, and the page that decided the verdict', async () => {
+        const status = await verifyWith(APP_BROWSER(), { dodump: true });
+
+        expect(status.authenticated).toBe(true);
+        expect(written('debug_check_after_nav.html')).toBe(true);
+        expect(written('debug_check_app.html')).toBe(true);
+    });
+
+    // The three are separate files on purpose. `check` is the command people
+    // re-run, its dump directory is per-minute, and a single `debug_check.html`
+    // would let a run that reported "expired" be overwritten minutes later by
+    // one that reported "stayed_unauthenticated" — destroying exactly the
+    // evidence the flag was asked for.
+    it('names each verdict dump after the verdict that produced it', async () => {
+        const state = { url: 'https://onenote.cloud.microsoft/notebooks/', marker: 'All Notebooks' };
+        await verifyWith(browserFollowing(state), { dodump: true });
+        Object.assign(state, { url: ONENOTE_SHELL, marker: undefined });
+        await verifyWith(browserFollowing(state), { dodump: true });
+        // Last, because this verdict deletes the auth file.
+        Object.assign(state, { url: LOGIN, login: true });
+        await verifyWith(browserFollowing(state), { dodump: true });
+
+        expect(written('debug_check_app.html')).toBe(true);
+        expect(written('debug_check_idle.html')).toBe(true);
+        expect(written('debug_check_login.html')).toBe(true);
+    });
+
+    it('writes a PNG beside every dump when screenshots are asked for', async () => {
+        await verifyWith(APP_BROWSER(), { dodump: true, screenshot: true });
+
+        for (const name of ['debug_check_after_nav', 'debug_check_app']) {
+            expect(written(`${name}.html`)).toBe(true);
+            expect(written(`${name}.png`)).toBe(true);
+        }
+    });
+
+    // The default, and the regression this whole flag could cause: the dumps
+    // must not start appearing on a plain `check`, which runs unattended in CI.
+    it('writes nothing at all unless dumps were asked for', async () => {
+        const status = await verifyWith(APP_BROWSER());
+
+        expect(status.authenticated).toBe(true);
+        expect(fs.readdirSync(dumpDir).filter(name => name.startsWith('debug_check'))).toEqual([]);
+    });
+
+    // The error path is where a dump earns its keep: the exception carries a
+    // message and nothing about the page that produced it, and a navigation
+    // timeout, a proxy page and a TLS failure all look alike in the log.
+    it('dumps the page that errored', async () => {
+        const failing = browserAt(ONENOTE_SHELL);
+        failing.newContext = async () => ({
+            newPage: async () => ({
+                goto: async () => { throw new Error('net::ERR_TIMED_OUT'); },
+                url: () => ONENOTE_SHELL,
+                evaluate: async () => '<!DOCTYPE html><html><body>error page</body></html>'
+            })
+        });
+
+        const status = await verifyWith(failing, { dodump: true });
+
+        expect(status.reason).toBe('unverifiable');
+        expect(written('debug_check_error.html')).toBe(true);
+    });
+
+    // A dump is a debugging aid; it must not be able to change the answer it
+    // exists to explain. dumpPage() throws on a write failure, and the call
+    // sites are inside verifyAuth()'s try block, so without this an unwritable
+    // dump directory would be caught as a verification error and a live session
+    // reported as unverifiable — the check failing for a reason of its own.
+    it('still reports the verdict when the dump cannot be written', async () => {
+        currentLogger().getDumpDir.mockResolvedValue(
+            path.join(os.tmpdir(), 'check-dump-no-such-dir', 'nested')
+        );
+
+        const status = await verifyWith(APP_BROWSER(), { dodump: true });
+
+        expect(status.authenticated).toBe(true);
+        expect(status.reason).toBe('authenticated');
+        expect(currentLogger().warn).toHaveBeenCalledWith(
+            expect.stringContaining('the check itself is unaffected')
+        );
+    });
+
+    // The two verdicts decided before a browser exists. Silence here would be
+    // indistinguishable from a broken dump directory, and those need opposite
+    // investigations.
+    it('says why there is no dump when no page was ever loaded', async () => {
+        const status = await require('../src/auth').verifyAuth({
+            targetUrl: ONENOTE_SHELL,
+            authFilePath: path.join(dir, 'nope.json'),
+            dodump: true
+        });
+
+        expect(status.reason).toBe('no_auth_file');
+        expect(currentLogger().info).toHaveBeenCalledWith(
+            expect.stringContaining('Nothing to dump')
+        );
+    });
+
+    // verifyAuth took two positionals until this change. A caller upgrading
+    // would have no other way to find out: the string would destructure to an
+    // undefined targetUrl and the check would run against OneNote and the
+    // default auth file, answering a question about a different session with
+    // what looks like a real result.
+    it('rejects the old positional arguments rather than quietly changing meaning', async () => {
+        const { verifyAuth } = require('../src/auth');
+
+        await expect(verifyAuth(ONENOTE_SHELL, authFile))
+            .rejects.toThrow(/single options object/);
     });
 });

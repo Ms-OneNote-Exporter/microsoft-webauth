@@ -110,7 +110,7 @@ describe('Auth Module', () => {
             await fs.writeJson('/tmp/test-auth.json', { cookies: [{ name: 'ESAuth', value: 'x' }], origins: [] });
 
             const { verifyAuth } = require('../src/auth');
-            const status = await verifyAuth('https://mock.test/nonexistent');
+            const status = await verifyAuth({ targetUrl: 'https://mock.test/nonexistent' });
 
             expect(status.reason).toBe('unverifiable');
             expect(status.authenticated).toBe(false);
