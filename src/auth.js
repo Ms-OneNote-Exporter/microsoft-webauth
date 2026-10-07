@@ -6,7 +6,15 @@
 const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
-const { waitForPhoneApproval } = require('./phone-approval');
+const { waitForPhoneApproval, PHONE_APPROVAL_TIMEOUT_MS } = require('./phone-approval');
+const {
+    LOGIN_REASONS,
+    LOGIN_EVENT_TYPES,
+    CHALLENGE_KINDS,
+    LoginError,
+    reasonForError,
+    makeEmitter
+} = require('./login-observer');
 const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir, ONENOTE_URL } = require('./config');
 const { version: PKG_VERSION } = require('../package.json');
 const path = require('path');
@@ -1343,12 +1351,22 @@ async function verifyAuthStateFile(authFilePath) {
  * @param {boolean} [credentials.notheadless]
  * @param {boolean} [credentials.dodump]
  * @param {boolean} [credentials.screenshot]
+ * @param {(event: object) => void} [credentials.onEvent]
+ *   Optional observer, called with `{ type, ...payload }` as `login()` sees the
+ *   screen change. Omitting it changes nothing — not the log, not the stdin
+ *   prompt, not the return value. See login-observer.js for the event set, and
+ *   for why the structured result arrives here rather than as a return value.
+ *
+ *   A throwing observer is logged and ignored: it is watching, not
+ *   participating, and the worst outcome must not be a working sign-in reported
+ *   as a failure.
  * @returns {Promise<boolean>} true when the login succeeded and the auth file is on disk
  */
 async function login(credentials = {}) {
     const { email, password, targetUrl, authFile, screenshot } = credentials;
     const isAutomated = !!(email && password);
     const headless = !credentials.notheadless && isAutomated;
+    const emit = makeEmitter(credentials.onEvent);
     // Use targetUrl if provided, otherwise default to ONENOTE_URL for backward compatibility
     const finalTargetUrl = targetUrl || ONENOTE_URL;
     // Shared across every clearBlockingScreens() call in this login so a screen that
@@ -1466,7 +1484,9 @@ async function login(credentials = {}) {
                 const usernameError = page.locator('#usernameError');
                 if (await usernameError.isVisible({ timeout: 2000 })) {
                     const errorMsg = await usernameError.textContent();
-                    throw new Error(`Login Error (Username): ${errorMsg?.trim()}`);
+                    // Microsoft itself rejected the account, so this is not a
+                    // navigation or a selector problem.
+                    throw new LoginError('credentials_rejected', `Login Error (Username): ${errorMsg?.trim()}`);
                 }
             } catch (e) {
                 logger.error(`Failed to enter email: ${e.message}`);
@@ -1517,27 +1537,38 @@ async function login(credentials = {}) {
                     const stuck = await readSignInState(page) || await readScreenState(page);
                     if (stuck) {
                         const needsCode = stuck.sendCode || stuck.approveApp || stuck.otcPrompt;
-                        throw new Error(
+                        throw new LoginError(
+                            // A code/approval screen is a *challenge*, not a bad
+                            // password, and the two need different advice from a
+                            // caller. Classified as the more specific of the two
+                            // challenge reasons, because that is what it is: this
+                            // screen was read, not misread.
+                            needsCode
+                                ? (stuck.approveApp ? 'approver_prompt' : 'code_prompt')
+                                : 'no_password_route',
                             `Password field never appeared. Still on ${shortUrl(stuck.url)} — heading: "${stuck.heading || '(none)'}".` +
                             (needsCode
                                 ? ' Microsoft is offering a code/phone approval here, not a password.'
                                 : ' This screen does not offer a password sign-in.')
                         );
                     }
-                    throw e;
+                    // No screen could be read at all, so there is no evidence for
+                    // any more specific claim.
+                    throw new LoginError('unreadable', e.message);
                 }
 
                 await passwordField.fill(password);
 
                 logger.debug('Submitting the sign-in form...');
                 if (!(await submitSignInForm(page))) {
-                    throw new Error('Password filled but no sign-in submit control was found.');
+                    throw new LoginError('interstitial',
+                        'Password filled but no sign-in submit control was found.');
                 }
 
                 const passwordError = page.locator('#passwordError');
                 if (await passwordError.isVisible({ timeout: 2000 })) {
                     const errorMsg = await passwordError.textContent();
-                    throw new Error(`Login Error (Password): ${errorMsg?.trim()}`);
+                    throw new LoginError('credentials_rejected', `Login Error (Password): ${errorMsg?.trim()}`);
                 }
             } catch (e) {
                 if (credentials.dodump) {
@@ -1591,10 +1622,41 @@ async function login(credentials = {}) {
                     // which is why nobody knew it waited rather than cancelled --
                     // and why this path was described as unsupported, and told to
                     // users, without anyone having run it.
-                    await waitForPhoneApproval(page, { logger });
+                    const approval = await waitForPhoneApproval(page, {
+                        logger,
+                        // Fires as soon as the number is known and *before* the
+                        // wait, so the caller's countdown starts when the
+                        // challenge actually starts rather than when it ends.
+                        onChallenge: ({ shown }) => emit('challenge', {
+                            kind: 'phone-approval',
+                            label: 'Approve the sign-in in Microsoft Authenticator.',
+                            timeoutMs: PHONE_APPROVAL_TIMEOUT_MS,
+                            // `'??'` means the number could not be read, which is
+                            // indistinguishable here from a screen that never had
+                            // one. Null is the honest report of both, and it is
+                            // what lets the caller say "tap approve" instead of
+                            // showing an empty box.
+                            number: shown === '??' ? null : shown
+                        })
+                    });
+                    if (approval.waited) {
+                        emit('challenge-seen', {});
+                    } else {
+                        emit('challenge-expired', {});
+                    }
                 } else if (verificationScreen) {
                     logger.warn('MFA/Verification screen detected.');
                     logger.step('A verification code is required. Please check your email or authenticator app.');
+
+                    emit('challenge', {
+                        kind: 'code',
+                        label: 'Enter the code Microsoft sent you.',
+                        // No deadline, stated as such rather than guessed. promptUser
+                        // waits on stdin indefinitely, so any timeout here would be a
+                        // number the caller could act on and this code could not honour.
+                        timeoutMs: null,
+                        number: null
+                    });
 
                     const code = await promptUser('Enter the verification code: ');
 
@@ -1609,6 +1671,12 @@ async function login(credentials = {}) {
                     if (!(await submitSignInForm(page))) {
                         logger.debug('No submit control found on the verification screen.');
                     }
+
+                    // After the code is submitted, not when it is read. Emitting it
+                    // on reading would tell a caller the challenge is resolved a
+                    // moment before Microsoft gets the chance to reject it, and the
+                    // caller would have nothing to report when it does.
+                    emit('challenge-seen', {});
                 }
             } catch (e) {
                 logger.debug(`Post-password verification handling skipped or failed: ${e.message}`);
@@ -1691,16 +1759,29 @@ async function login(credentials = {}) {
         if (!written.ok) {
             logger.error(`Login reached the authenticated interface but the auth file is not usable (${written.reason}): ${written.detail}`);
             logger.error('Treating this as a failed login: there is no usable state to save.');
+            // Reached the app and still failed: the sign-in worked, the artefact
+            // did not. Only the throw site knows the difference between this and
+            // `network`, so it is the one that names it.
+            emit('login-result', { ok: false, reason: 'auth_state_unusable' });
             return false;
         }
 
         logger.success(`Authentication successful! State saved to ${filePath}`);
+        // `reason` is null on success rather than a member of LOGIN_REASONS: every
+        // value in that set names something that went wrong, and naming one here
+        // would force a caller to branch on `ok` *and* read the reason, or to
+        // handle a reason it thought was impossible.
+        emit('login-result', { ok: true, reason: null });
         return true;
     } catch (error) {
         logger.error('Authentication failed or cancelled:', error);
         if (isAutomated) {
             logger.debug('Possible cause: incorrect credentials, MFA requirement, or selector change.');
         }
+        // Terminal and exactly once. A caller that is waiting on this event to
+        // learn the outcome cannot be left hanging by a failure, so it is emitted
+        // from the catch as well as from the two success-side returns.
+        emit('login-result', { ok: false, reason: reasonForError(error) });
         return false;
     } finally {
         if (browser) {
@@ -2025,6 +2106,19 @@ async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
 
 module.exports = {
     login,
+    // The login observer's vocabulary, re-exported from the package main.
+    //
+    // So a caller can build its mapping table against the *real* set — importing
+    // `@msout/microsoft-webauth/login-observer` instead would be a second path
+    // into this package that `package.json` does not list in `exports`, and an
+    // unlisted subpath is the kind of thing that works locally and 404s for a
+    // consumer. The backend asserts its table against these; if one of them
+    // changes, its test goes red rather than a new cause being folded into a
+    // generic message.
+    LOGIN_REASONS,
+    LOGIN_EVENT_TYPES,
+    CHALLENGE_KINDS,
+    LoginError,
     // Exported so a caller can assert the number-match behaviour directly, and
     // so the path is reachable from a test rather than only from inside login().
     waitForPhoneApproval,

@@ -44,10 +44,16 @@ const NUMBER_MATCH_SELECTOR = '.displaySign, [data-testid="displaySign"]';
  * **not** an error: the caller continues to the redirect wait, which is the
  * honest outcome for a user who never answered their phone.
  *
+ * `onChallenge` is called once, as soon as `shown` is known and before the wait
+ * begins. It is a hook rather than a return value because the number has to be
+ * announced while the challenge is still outstanding: a caller that learns it
+ * afterwards has already missed the window it needed to display it in.
+ *
+ * @param {(detail: {shown: string}) => void} [options.onChallenge]
  * @returns {Promise<{ shown: string, waited: boolean }>} `shown` is the number
  *   displayed, or `'??'` when it could not be read.
  */
-async function waitForPhoneApproval(page, { logger } = {}) {
+async function waitForPhoneApproval(page, { logger, onChallenge } = {}) {
     const log = logger || console;
 
     log.warn?.('Number Matching MFA detected ("Approve sign in request" screen).');
@@ -73,6 +79,15 @@ async function waitForPhoneApproval(page, { logger } = {}) {
     log.step?.('  Then tap "Yes" / "Approve" in the app.');
     log.step?.('══════════════════════════════════════════════════════');
     log.info?.(`Waiting for phone approval (up to ${PHONE_APPROVAL_TIMEOUT_MS / 1000} seconds)...`);
+
+    // Announced after the log block so the terminal still leads with the number
+    // for an interactive user. Swallowed for the same reason as the read above:
+    // an observer's bug must not cancel a wait the user is about to satisfy.
+    try {
+        onChallenge?.({ shown });
+    } catch (_) {
+        log.debug?.('Challenge observer threw; continuing to wait for approval.');
+    }
 
     let waited = false;
     try {
