@@ -6,6 +6,7 @@
 const { chromium } = require('playwright');
 const fs = require('fs-extra');
 const logger = require('./utils/logger');
+const { waitForPhoneApproval } = require('./phone-approval');
 const { DEFAULT_AUTH_FILE, getAuthMetaFilePath, ensureAuthDir, ONENOTE_URL } = require('./config');
 const { version: PKG_VERSION } = require('../package.json');
 const path = require('path');
@@ -1586,30 +1587,11 @@ async function login(credentials = {}) {
                 }
 
                 if (verificationScreen === 'number_match') {
-                    logger.warn('Number Matching MFA detected ("Approve sign in request" screen).');
-
-                    let matchNumber = '??';
-                    try {
-                        matchNumber = await page.locator(NUMBER_MATCH).first().textContent().catch(() => null) || '??';
-                    } catch (_) {
-                        logger.debug('Could not extract the number-match code — user may still see it if --notheadless is used.');
-                    }
-
-                    logger.step('══════════════════════════════════════════════════════');
-                    logger.step(`  ACTION REQUIRED: Open Microsoft Authenticator on your phone.`);
-                    logger.step(`  Enter the number:  ${matchNumber.trim()}`);
-                    logger.step(`  Then tap "Yes" / "Approve" in the app.`);
-                    logger.step('══════════════════════════════════════════════════════');
-                    logger.info('Waiting for phone approval (up to 120 seconds)...');
-
-                    await Promise.race([
-                        page.waitForSelector(NUMBER_MATCH, { state: 'hidden', timeout: 120000 }),
-                        page.waitForURL(url => !url.toString().includes('login.microsoftonline.com'), { timeout: 120000 }),
-                        page.waitForSelector('text=/Stay signed in/i', { timeout: 120000 }),
-                    ]);
-
-                    logger.success('Phone approval received. Continuing login flow...');
-
+                    // Extracted so it can be tested. It was inline and anonymous,
+                    // which is why nobody knew it waited rather than cancelled --
+                    // and why this path was described as unsupported, and told to
+                    // users, without anyone having run it.
+                    await waitForPhoneApproval(page, { logger });
                 } else if (verificationScreen) {
                     logger.warn('MFA/Verification screen detected.');
                     logger.step('A verification code is required. Please check your email or authenticator app.');
@@ -2043,6 +2025,9 @@ async function checkAuth(targetUrl = ONENOTE_URL, authFilePath) {
 
 module.exports = {
     login,
+    // Exported so a caller can assert the number-match behaviour directly, and
+    // so the path is reachable from a test rather than only from inside login().
+    waitForPhoneApproval,
     getAuthenticatedContext,
     checkAuth,
     verifyAuth,
