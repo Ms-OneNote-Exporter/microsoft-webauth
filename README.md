@@ -126,6 +126,81 @@ With custom auth file path:
 microsoft-webauth logout --auth-file /path/to/authfile.json
 ```
 
+## Observing a login (library callers)
+
+`login()` still resolves a **boolean** — that has not changed, and changing it
+would break every existing caller. What is new is an optional `onEvent`
+callback, for a caller that needs to know *what happened* rather than whether
+something did.
+
+```js
+const { login, LOGIN_REASONS } = require('@msout/microsoft-webauth');
+
+await login({
+  email,
+  password,
+  onEvent: ({ type, ...payload }) => console.log(type, payload),
+});
+```
+
+A boolean says a login failed. It cannot say whether the password was wrong,
+whether Microsoft is asking for a code, or whether the network went away — and
+those need different advice. Telling someone their correct password is wrong
+sends them to reset it.
+
+| Event | Payload | When |
+|-------|---------|------|
+| `challenge` | `{ kind, label, timeoutMs, number }` | a prompt is waiting on the user |
+| `challenge-seen` | `{}` | the prompt was answered |
+| `challenge-expired` | `{}` | it was not |
+| `login-result` | `{ ok, reason }` | terminal; **always** fires, exactly once |
+
+`reason` is `null` when `ok` is true, and otherwise a member of `LOGIN_REASONS` —
+never both. The set is exported and frozen:
+
+| Reason | |
+|--------|---|
+| `credentials_rejected` | Microsoft refused the password or account |
+| `code_prompt` | Microsoft is asking for a one-time code |
+| `approver_prompt` | Authenticator is asking for a push approval |
+| `no_password_route` | this screen offers no way to reach a password |
+| `auth_state_unusable` | the app loaded but no usable auth state was saved |
+| `interstitial` | a screen this tool does not know how to act on |
+| `unreadable` | the screen could not be read at all |
+| `network` | the page could not be reached |
+| `timed_out` | the attempt exceeded its deadline |
+| `unchanged`, `max_steps`, `password_field` | internal to the sign-in-method walk |
+| `unknown` | an error escaped that the package does not recognise |
+
+`unknown` is deliberate. Every other value names a screen that was actually
+observed and that a caller can act on. Rather than forcing an unrecognised
+failure into the closest-looking reason — which turns one generic failure into
+several specific lies — the package declines to name a cause it cannot evidence.
+
+### Challenges
+
+`kind` is `'code'` (type a code) or `'phone-approval'` (act in Authenticator).
+
+There is deliberately **no** separate number-matching kind. Reading a number and
+simply tapping approve are the same screen, and this package cannot tell them
+apart even in principle: the number is unreadable and the number is absent, and
+both look identical from here. So `number` is a field rather than a kind —
+`number !== null` means "read this and enter it in Authenticator", `null` means
+"there is nothing to read, just tap approve".
+
+That field matters more than it looks. The login runs **headless**: there is no
+Microsoft window for a user to read a number from, so if the number does not
+leave this package it never reaches the screen.
+
+`timeoutMs` is a real deadline or `null`. The code prompt has none — the terminal
+waits for input indefinitely — so it is reported as `null` rather than given a
+number the login would not honour.
+
+`onEvent` is a watcher, not a participant: an observer that throws is logged and
+ignored, because a caller's bug must never turn a working sign-in into a failed
+one. Omitting `onEvent` changes nothing — not the log, not the stdin prompt, not
+the return value.
+
 ## Exit codes
 
 `login` and `check` exit `0` only when they actually succeeded, so a shell script
@@ -250,12 +325,14 @@ npm run test:coverage
 ```
 microsoft-webauth-playwright/
 ├── src/
-│   ├── auth.js          # Authentication logic
-│   ├── config.js        # Configuration (paths, URLs)
+│   ├── auth.js            # Authentication logic
+│   ├── config.js          # Configuration (paths, URLs)
+│   ├── login-observer.js  # Reason vocabulary and the onEvent emitter
+│   ├── phone-approval.js  # The number-match MFA wait
 │   └── utils/
-│       ├── logger.js    # Logging utilities
-│       └── retry.js     # Retry helpers
-├── test/                # Jest tests
+│       ├── logger.js      # Logging utilities
+│       └── retry.js       # Retry helpers
+├── test/                  # Jest tests
 ├── package.json
 └── README.md
 ```
