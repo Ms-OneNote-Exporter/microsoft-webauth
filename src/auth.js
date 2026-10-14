@@ -109,15 +109,50 @@ async function logout(authFilePath) {
 /**
  * Prompts the user for input in the terminal.
  */
+/**
+ * The resolver for the pending `promptUser` call, or null when no prompt is
+ * waiting. Set by `promptUser` and consumed by `answerChallenge`.
+ *
+ * Module-level because `promptUser` and `answerChallenge` are both internal
+ * to this file and the resolver must survive between the two calls.
+ */
+let pendingPromptResolver = null;
+
 function promptUser(query) {
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout
     });
-    return new Promise(resolve => rl.question(query, ans => {
-        rl.close();
-        resolve(ans);
-    }));
+    return new Promise(resolve => {
+        pendingPromptResolver = resolve;
+        rl.question(query, ans => {
+            rl.close();
+            pendingPromptResolver = null;
+            resolve(ans);
+        });
+    });
+}
+
+/**
+ * answerChallenge resolves a pending `promptUser` call with the given code.
+ *
+ * Returns `true` if a prompt was waiting and was answered, `false` if no
+ * prompt was pending. A `false` return means the login flow is not waiting
+ * for a code (it may have timed out, or it may be a push-approval challenge
+ * that needs no code).
+ *
+ * The stdin prompt path is untouched: if `promptUser` is called in a non-TTY
+ * context, `readline` will refuse as before. This function provides an
+ * alternative path for callers that receive the code out-of-band (via HTTP).
+ */
+function answerChallenge(code) {
+    if (pendingPromptResolver === null) {
+        return false;
+    }
+    const resolve = pendingPromptResolver;
+    pendingPromptResolver = null;
+    resolve(code);
+    return true;
 }
 
 /**
@@ -2122,6 +2157,9 @@ module.exports = {
     // Exported so a caller can assert the number-match behaviour directly, and
     // so the path is reachable from a test rather than only from inside login().
     waitForPhoneApproval,
+    // Exported so a caller can answer a code challenge out-of-band (via HTTP)
+    // rather than through stdin. Returns true if a prompt was waiting.
+    answerChallenge,
     getAuthenticatedContext,
     checkAuth,
     verifyAuth,
